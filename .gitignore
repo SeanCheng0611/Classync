@@ -1,0 +1,9 @@
+node_modules/
+server/data/*.db
+server/data/*.db-*
+server/data.sqlite
+server/.env
+server/*.log
+client/*.log
+dist/
+.claude/settings.local.json
