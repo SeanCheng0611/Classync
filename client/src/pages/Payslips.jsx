@@ -31,7 +31,6 @@ export default function Payslips() {
   return (
     <div>
       <h2>薪資系統</h2>
-      <p style={{ color: 'var(--text-muted)', fontSize: 13 }}>點擊教師姓名進入該教師的薪資條開立介面。</p>
 
       <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 12 }}>
         <thead>

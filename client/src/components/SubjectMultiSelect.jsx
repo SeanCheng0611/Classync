@@ -3,8 +3,8 @@ import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
 import { parseSubjects } from '../lib/subjects';
 
-// 科目下拉選單：選項存在「設定」子系統（跟著補習班走，所有裝置共用），可在此或設定頁增刪/恢復預設
-export default function SubjectSelect({ value, onChange }) {
+// 科目多選：只能勾選「設定」子系統裡已存在的科目，不開放自由輸入；可在此或設定頁增刪/恢復預設
+export default function SubjectMultiSelect({ value, onChange }) {
   const { currentSchoolId, schoolSettings } = useAuth();
   const subjects = parseSubjects(schoolSettings);
   const [managing, setManaging] = useState(false);
@@ -29,18 +29,31 @@ export default function SubjectSelect({ value, onChange }) {
 
   const removeSubject = (s) => {
     saveSubjects(subjects.filter((x) => x !== s));
-    if (value === s) onChange('');
+    if (value.includes(s)) onChange(value.filter((v) => v !== s));
+  };
+
+  const toggle = (s) => {
+    onChange(value.includes(s) ? value.filter((v) => v !== s) : [...value, s]);
   };
 
   return (
     <div>
-      <div style={{ display: 'flex', gap: 8 }}>
-        <select value={value} onChange={(e) => onChange(e.target.value)} style={{ flex: 1 }}>
-          <option value="">請選擇</option>
-          {subjects.map((s) => (
-            <option key={s} value={s}>{s}</option>
-          ))}
-        </select>
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+        {subjects.map((s) => (
+          <button
+            key={s}
+            type="button"
+            onClick={() => toggle(s)}
+            className="pill"
+            style={
+              value.includes(s)
+                ? { background: 'var(--accent)', color: '#fff', border: 'none' }
+                : { background: 'transparent', border: '1px solid var(--border-strong)' }
+            }
+          >
+            {s}
+          </button>
+        ))}
         <button type="button" onClick={() => setManaging((v) => !v)}>{managing ? '完成' : '管理'}</button>
       </div>
       {error && <p style={{ margin: '4px 0 0', color: 'var(--danger)', fontSize: 13 }}>{error}</p>}

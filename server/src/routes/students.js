@@ -5,6 +5,8 @@ import { requireMembership } from '../auth/middleware.js';
 import { broadcastChange } from '../realtime/index.js';
 import { ensureSessionsForRange } from '../services/sessions.js';
 import { calcStudentTuitionForMonth } from '../services/finance.js';
+import { addToTrash, captureStudent } from '../services/trash.js';
+import { sortStudents } from '../services/nameSort.js';
 
 export const studentsRouter = Router({ mergeParams: true });
 studentsRouter.use(requireMembership());
@@ -14,17 +16,15 @@ function serialize(row) {
 }
 
 // 教師只能查看自己名下的學生（唯讀），管理者可查看全部
-// 依編號排序（編號視為數字排序，沒有編號的排在最後，再依姓名排序）
-const ORDER_BY_STUDENT_NO = "ORDER BY (student_no IS NULL OR student_no = ''), CAST(student_no AS INTEGER), name";
-
+// 排序：1. 學校名筆畫 2. 年級低到高 3. 學生姓名筆畫；前端列表的「編號」欄位依這個順序從 1 編起，純顯示用不寫回資料庫
 studentsRouter.get('/', (req, res) => {
   const rows =
     req.membership.role !== 'teacher'
-      ? db.prepare(`SELECT * FROM students WHERE school_id = ? ${ORDER_BY_STUDENT_NO}`).all(req.params.schoolId)
+      ? db.prepare('SELECT * FROM students WHERE school_id = ?').all(req.params.schoolId)
       : db
-          .prepare(`SELECT * FROM students WHERE school_id = ? AND teacher_id = ? ${ORDER_BY_STUDENT_NO}`)
+          .prepare('SELECT * FROM students WHERE school_id = ? AND teacher_id = ?')
           .all(req.params.schoolId, req.membership.teacher_id || '');
-  res.json(rows.map(serialize));
+  res.json(sortStudents(rows).map(serialize));
 });
 
 studentsRouter.get('/:id', (req, res) => {
@@ -160,6 +160,21 @@ studentsRouter.delete('/:id/tuition', requireMembership(['admin']), (req, res) =
   const { month } = req.query;
   if (!month) return res.status(400).json({ error: 'month required (YYYY-MM)' });
 
+  const existing = db
+    .prepare('SELECT * FROM tuition_records WHERE school_id = ? AND student_id = ? AND month = ?')
+    .get(req.params.schoolId, req.params.id, month);
+  if (existing) {
+    const student = db.prepare('SELECT name FROM students WHERE id = ?').get(req.params.id);
+    addToTrash(
+      req.params.schoolId,
+      'tuition_record',
+      `${student?.name || '未知學生'} ${month} 學費紀錄`,
+      { tables: [{ table: 'tuition_records', rows: [existing] }] },
+      req.user.id,
+      { studentIds: [req.params.id] }
+    );
+  }
+
   db.prepare('DELETE FROM tuition_records WHERE school_id = ? AND student_id = ? AND month = ?').run(
     req.params.schoolId,
     req.params.id,
@@ -171,33 +186,27 @@ studentsRouter.delete('/:id/tuition', requireMembership(['admin']), (req, res) =
 });
 
 studentsRouter.post('/', requireMembership(['admin', 'front_desk']), (req, res) => {
-  const { student_no, name, grade, school_name, subjects, teacher_id, tuition_monthly, note } = req.body;
+  const { name, grade, school_name, subjects, teacher_id, tuition_monthly, note, status } = req.body;
   if (!name || !grade) return res.status(400).json({ error: 'name and grade required' });
 
-  // 編號不可重複（同一補習班內），姓名重複則不擋，只在回傳結果中提醒
-  if (student_no) {
-    const dupNo = db
-      .prepare('SELECT id FROM students WHERE school_id = ? AND student_no = ?')
-      .get(req.params.schoolId, student_no);
-    if (dupNo) return res.status(409).json({ error: `編號「${student_no}」已存在，請確認編號是否重複` });
-  }
+  // 姓名重複不擋，只在回傳結果中提醒（前端匯入/新增流程改成在送出前先跳視窗詢問，這裡只當保險）
   const dupName = db.prepare('SELECT id FROM students WHERE school_id = ? AND name = ?').get(req.params.schoolId, name);
 
   const id = nanoid();
   db.prepare(
-    `INSERT INTO students (id, school_id, student_no, name, grade, school_name, subjects, teacher_id, tuition_monthly, note)
+    `INSERT INTO students (id, school_id, name, grade, school_name, subjects, teacher_id, tuition_monthly, note, status)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     req.params.schoolId,
-    student_no || null,
     name,
     grade,
     school_name || null,
     JSON.stringify(subjects || []),
     teacher_id || null,
     tuition_monthly || 0,
-    note || null
+    note || null,
+    status === 'inactive' ? 'inactive' : 'active'
   );
 
   broadcastChange(req.params.schoolId, 'students');
@@ -211,7 +220,6 @@ studentsRouter.put('/:id', requireMembership(['admin', 'front_desk']), (req, res
   if (!existing) return res.status(404).json({ error: 'not found' });
 
   const {
-    student_no = existing.student_no,
     name = existing.name,
     grade = existing.grade,
     school_name = existing.school_name,
@@ -222,21 +230,14 @@ studentsRouter.put('/:id', requireMembership(['admin', 'front_desk']), (req, res
     status = existing.status,
   } = req.body;
 
-  if (student_no) {
-    const dupNo = db
-      .prepare('SELECT id FROM students WHERE school_id = ? AND student_no = ? AND id != ?')
-      .get(req.params.schoolId, student_no, req.params.id);
-    if (dupNo) return res.status(409).json({ error: `編號「${student_no}」已存在，請確認編號是否重複` });
-  }
   const dupName = db
     .prepare('SELECT id FROM students WHERE school_id = ? AND name = ? AND id != ?')
     .get(req.params.schoolId, name, req.params.id);
 
   db.prepare(
-    `UPDATE students SET student_no=?, name=?, grade=?, school_name=?, subjects=?, teacher_id=?, tuition_monthly=?, note=?, status=?, updated_at=datetime('now')
+    `UPDATE students SET name=?, grade=?, school_name=?, subjects=?, teacher_id=?, tuition_monthly=?, note=?, status=?, updated_at=datetime('now')
      WHERE id = ?`
   ).run(
-    student_no,
     name,
     grade,
     school_name,
@@ -253,6 +254,11 @@ studentsRouter.put('/:id', requireMembership(['admin', 'front_desk']), (req, res
 });
 
 studentsRouter.delete('/:id', requireMembership(['admin', 'front_desk']), (req, res) => {
+  const existing = db.prepare('SELECT * FROM students WHERE school_id = ? AND id = ?').get(req.params.schoolId, req.params.id);
+  if (!existing) return res.status(204).end();
+
+  addToTrash(req.params.schoolId, 'student', existing.name, captureStudent(req.params.id), req.user.id);
+
   db.prepare('DELETE FROM students WHERE school_id = ? AND id = ?').run(
     req.params.schoolId,
     req.params.id

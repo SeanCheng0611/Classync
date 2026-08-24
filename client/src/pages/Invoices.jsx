@@ -31,7 +31,6 @@ export default function Invoices() {
   return (
     <div>
       <h2>繳費單系統</h2>
-      <p style={{ color: 'var(--text-muted)', fontSize: 13 }}>點擊學生姓名進入該學生的繳費單開立介面。</p>
 
       <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 12 }}>
         <thead>

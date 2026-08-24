@@ -23,12 +23,20 @@ export function slotRangeLabel(startSlot, durationSlots) {
   return `${slotToTime(startSlot)} - ${slotToTime(startSlot + durationSlots)}`;
 }
 
-// 下拉選單顯示順序從 18:00 開始（補習班主要上課時段），往後排到隔天 17:30 再循環回來
-const TIME_OPTIONS_START_SLOT = 36; // 18:00
-export const TIME_OPTIONS = (() => {
+// 下拉選單顯示順序：[起始,結束) 範圍內的時段（補習班主要上課時段，「設定」子系統可調整）排最前面，
+// 其餘時段接在後面照時間順序排列繞回來；純粹影響排序，不限制可選擇的時間
+export function computeTimeOptions(rangeStart, rangeEnd) {
   const all = Array.from({ length: 48 }, (_, slot) => slotToTime(slot));
-  return [...all.slice(TIME_OPTIONS_START_SLOT), ...all.slice(0, TIME_OPTIONS_START_SLOT)];
-})();
+  const startSlot = timeToSlot(rangeStart || '18:00');
+  const endSlot = timeToSlot(rangeEnd || '21:00');
+  if (endSlot <= startSlot) return [...all.slice(startSlot), ...all.slice(0, startSlot)];
+  return [...all.slice(startSlot, endSlot + 1), ...all.slice(endSlot + 1), ...all.slice(0, startSlot)];
+}
+
+export const TIME_OPTIONS = computeTimeOptions('18:00', '21:00');
+
+// TimeInput 下拉選單固定從 17:00 開始列（不受「設定」子系統的起始/結束時間影響——那組設定只用來決定表單欄位直接帶入的預設值）
+export const DROPDOWN_TIME_OPTIONS = computeTimeOptions('17:00', '17:00');
 
 // 時長以「小時」為單位輸入（可半小時級距），內部仍以半小時 slot 數儲存
 export function hoursToDurationSlots(hours) {
@@ -37,6 +45,13 @@ export function hoursToDurationSlots(hours) {
 
 export function durationSlotsToHours(slots) {
   return slots / 2;
+}
+
+// 依起始時間＋預設堂課時長（小時）算出結束時間，超過當日最後一個時段（23:30）時鎖在 23:30
+export function addHoursToTime(startHHMM, hours) {
+  const startSlot = timeToSlot(startHHMM);
+  const endSlot = Math.min(47, startSlot + hoursToDurationSlots(hours));
+  return slotToTime(endSlot);
 }
 
 export function todayStr() {

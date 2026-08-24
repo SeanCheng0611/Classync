@@ -3,6 +3,7 @@ import { nanoid } from 'nanoid';
 import { db } from '../db/index.js';
 import { requireAuth, requireOwner } from '../auth/middleware.js';
 import { broadcastChange, broadcastForceReload } from '../realtime/index.js';
+import { addToTrash, captureMembership } from '../services/trash.js';
 
 export const schoolsRouter = Router();
 schoolsRouter.use(requireAuth);
@@ -84,6 +85,108 @@ schoolsRouter.put('/:schoolId/tuition-defaults', (req, res) => {
 
   broadcastChange(req.params.schoolId, 'tuition-defaults');
   res.json({ ...db.prepare('SELECT * FROM schools WHERE id = ?').get(req.params.schoolId), role: membership.role });
+});
+
+// 「設定」子系統：一對多班級人數上限、時間選單優先範圍、固定課預設展開月數；僅管理者可調整
+schoolsRouter.put('/:schoolId/scheduling-settings', (req, res) => {
+  const membership = getMembership(req.user.id, req.params.schoolId);
+  if (!membership || membership.role !== 'admin') return res.status(403).json({ error: 'admin only' });
+
+  const school = db.prepare('SELECT * FROM schools WHERE id = ?').get(req.params.schoolId);
+  if (!school) return res.status(404).json({ error: 'not found' });
+
+  const {
+    group_class_max_students = school.group_class_max_students,
+    time_picker_range_start = school.time_picker_range_start,
+    time_picker_range_end = school.time_picker_range_end,
+    default_schedule_span_months = school.default_schedule_span_months,
+    default_class_duration_hours = school.default_class_duration_hours,
+  } = req.body;
+
+  const maxStudents = Number(group_class_max_students);
+  if (!Number.isInteger(maxStudents) || maxStudents < 1) {
+    return res.status(400).json({ error: '一對多班級人數上限需為正整數' });
+  }
+  const spanMonths = Number(default_schedule_span_months);
+  if (!Number.isInteger(spanMonths) || spanMonths < 1) {
+    return res.status(400).json({ error: '固定課預設展開月數需為正整數' });
+  }
+  if (!/^\d{2}:\d{2}$/.test(time_picker_range_start) || !/^\d{2}:\d{2}$/.test(time_picker_range_end)) {
+    return res.status(400).json({ error: '時間格式需為 HH:MM' });
+  }
+  const durationHours = Number(default_class_duration_hours);
+  if (!Number.isFinite(durationHours) || durationHours <= 0 || durationHours > 24) {
+    return res.status(400).json({ error: '預設堂課時長需為大於 0 的數字' });
+  }
+
+  db.prepare(
+    `UPDATE schools SET group_class_max_students = ?, time_picker_range_start = ?, time_picker_range_end = ?, default_schedule_span_months = ?, default_class_duration_hours = ?
+     WHERE id = ?`
+  ).run(maxStudents, time_picker_range_start, time_picker_range_end, spanMonths, durationHours, req.params.schoolId);
+
+  broadcastChange(req.params.schoolId, 'scheduling-settings');
+  res.json({ ...db.prepare('SELECT * FROM schools WHERE id = ?').get(req.params.schoolId), role: membership.role });
+});
+
+// 科目選單：排課表單的科目下拉選項，僅管理者可調整；「恢復預設」由前端直接送出預設清單即可，不需要另外的端點
+schoolsRouter.put('/:schoolId/subjects', (req, res) => {
+  const membership = getMembership(req.user.id, req.params.schoolId);
+  if (!membership || membership.role !== 'admin') return res.status(403).json({ error: 'admin only' });
+
+  const school = db.prepare('SELECT * FROM schools WHERE id = ?').get(req.params.schoolId);
+  if (!school) return res.status(404).json({ error: 'not found' });
+
+  const { subjects } = req.body;
+  if (!Array.isArray(subjects)) return res.status(400).json({ error: 'subjects must be an array' });
+  const cleaned = [...new Set(subjects.map((s) => String(s).trim()).filter(Boolean))];
+  if (cleaned.length === 0) return res.status(400).json({ error: '至少需要保留一個科目' });
+
+  db.prepare('UPDATE schools SET subjects = ? WHERE id = ?').run(JSON.stringify(cleaned), req.params.schoolId);
+
+  broadcastChange(req.params.schoolId, 'scheduling-settings');
+  res.json({ ...db.prepare('SELECT * FROM schools WHERE id = ?').get(req.params.schoolId), role: membership.role });
+});
+
+const TYPE_COLOR_KEYS = ['regular', 'extra', 'makeup', 'leave'];
+const SWATCH_KEYS = ['camel', 'red', 'green', 'blue', 'purple', 'gray'];
+
+// 課表／點名子系統的課堂類型標籤顏色：固定課(regular)/加課(extra)/調課(makeup) 各挑一個莫蘭迪色票代號，僅管理者可調整
+schoolsRouter.put('/:schoolId/type-colors', (req, res) => {
+  const membership = getMembership(req.user.id, req.params.schoolId);
+  if (!membership || membership.role !== 'admin') return res.status(403).json({ error: 'admin only' });
+
+  const school = db.prepare('SELECT * FROM schools WHERE id = ?').get(req.params.schoolId);
+  if (!school) return res.status(404).json({ error: 'not found' });
+
+  const { type_colors } = req.body;
+  if (!type_colors || typeof type_colors !== 'object' || Array.isArray(type_colors)) {
+    return res.status(400).json({ error: 'type_colors must be an object' });
+  }
+  for (const [key, value] of Object.entries(type_colors)) {
+    if (!TYPE_COLOR_KEYS.includes(key)) return res.status(400).json({ error: `不支援的課堂類型：${key}` });
+    if (!SWATCH_KEYS.includes(value)) return res.status(400).json({ error: `不支援的色票：${value}` });
+  }
+
+  db.prepare('UPDATE schools SET type_colors = ? WHERE id = ?').run(JSON.stringify(type_colors), req.params.schoolId);
+
+  broadcastChange(req.params.schoolId, 'scheduling-settings');
+  res.json({ ...db.prepare('SELECT * FROM schools WHERE id = ?').get(req.params.schoolId), role: membership.role });
+});
+
+// 座位系統版面（座位排列位置）：admin/front_desk 皆可調整，layout 是二維陣列，每個內層陣列（一橫排）最多 4 個座位編號
+schoolsRouter.put('/:schoolId/seat-layout', (req, res) => {
+  const membership = getMembership(req.user.id, req.params.schoolId);
+  if (!membership || !['admin', 'front_desk'].includes(membership.role)) return res.status(403).json({ error: 'forbidden' });
+
+  const { layout } = req.body;
+  const valid =
+    Array.isArray(layout) &&
+    layout.every((row) => Array.isArray(row) && row.length <= 4 && row.every((n) => Number.isInteger(n) && n >= 1));
+  if (!valid) return res.status(400).json({ error: '座位版面格式錯誤，每排最多 4 個座位' });
+
+  db.prepare('UPDATE schools SET seat_layout = ? WHERE id = ?').run(JSON.stringify(layout), req.params.schoolId);
+  broadcastChange(req.params.schoolId, 'seat-layout');
+  res.json({ layout });
 });
 
 // 刪除整間補習班：僅平台最高權限者（owner）可執行，FK cascade 會一併清除其下所有資料
@@ -179,6 +282,12 @@ schoolsRouter.delete('/:schoolId/members/:membershipId', (req, res) => {
       .get(req.params.schoolId);
     if (count <= 1) return res.status(400).json({ error: '無法移除最後一位管理者' });
   }
+
+  const user = db.prepare('SELECT display_name FROM users WHERE id = ?').get(target.user_id);
+  const roleLabel = { admin: '管理者', teacher: '教師', front_desk: '櫃台' }[target.role] || target.role;
+  addToTrash(req.params.schoolId, 'membership', `${user?.display_name || '未知使用者'}（${roleLabel}）`, captureMembership(req.params.membershipId), req.user.id, {
+    teacherId: target.teacher_id || null,
+  });
 
   db.prepare('DELETE FROM memberships WHERE id = ?').run(req.params.membershipId);
   res.status(204).end();

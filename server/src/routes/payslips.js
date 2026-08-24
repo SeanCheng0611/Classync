@@ -5,6 +5,7 @@ import { requireMembership } from '../auth/middleware.js';
 import { broadcastChange } from '../realtime/index.js';
 import { ensureSessionsForRange } from '../services/sessions.js';
 import { monthRange, calcSessionPay } from '../services/finance.js';
+import { addToTrash, capturePayslip } from '../services/trash.js';
 
 export const payslipsRouter = Router({ mergeParams: true });
 payslipsRouter.use(requireMembership(['admin']));
@@ -61,6 +62,8 @@ payslipsRouter.post('/', (req, res) => {
   const teacher = db.prepare('SELECT * FROM teachers WHERE id = ? AND school_id = ?').get(teacher_id, req.params.schoolId);
   if (!teacher) return res.status(404).json({ error: 'teacher not found' });
 
+  const today = db.prepare(`SELECT date('now') as d`).get().d;
+
   const items = [];
   for (const sessionId of session_ids) {
     const session = db
@@ -71,10 +74,16 @@ payslipsRouter.post('/', (req, res) => {
     if (already) {
       return res.status(409).json({ error: `${session.session_date} ${session.subject} 已開立過薪資條，無法重複開立` });
     }
+    if (session.session_date > today) {
+      return res.status(400).json({ error: `${session.session_date} ${session.subject} 尚未發生，無法開立薪資` });
+    }
     const item = calcSessionPay(teacher, session);
     if (item.fully_on_leave) {
       const label = item.leave_is_makeup ? '已調課' : '已請假';
       return res.status(400).json({ error: `${session.session_date} ${session.subject}（${label}）無法計入薪資` });
+    }
+    if (item.not_yet_marked) {
+      return res.status(400).json({ error: `${session.session_date} ${session.subject} 尚未點名，無法開立薪資` });
     }
     items.push(item);
   }
@@ -101,21 +110,31 @@ payslipsRouter.get('/:id', (req, res) => {
 
   const items = db
     .prepare(
-      `SELECT pi.id, pi.hours, pi.rate, pi.pay, cs.session_date, cs.subject, cs.type,
+      `SELECT pi.id, pi.session_id, pi.hours, pi.rate, pi.pay, cs.session_date, cs.subject, cs.type, cs.start_slot, cs.duration_slots,
               origin.session_date as origin_session_date, origin.start_slot as origin_start_slot
        FROM payslip_items pi JOIN class_sessions cs ON cs.id = pi.session_id
        LEFT JOIN class_sessions origin ON origin.id = cs.origin_session_id
        WHERE pi.payslip_id = ? ORDER BY cs.session_date`
     )
     .all(req.params.id);
+  const withStudents = items.map((i) => {
+    const students = db
+      .prepare(`SELECT s.name FROM session_students ss JOIN students s ON s.id = ss.student_id WHERE ss.session_id = ?`)
+      .all(i.session_id);
+    return { ...i, student_names: students.map((s) => s.name), is_admin: students.length === 0 };
+  });
 
-  res.json({ ...payslip, items });
+  res.json({ ...payslip, items: withStudents });
 });
 
 // 刪除薪資條：釋放其中的課堂讓它們可以被重新開立，若已產生對應的收支明細也一併刪除
 payslipsRouter.delete('/:id', (req, res) => {
   const payslip = db.prepare('SELECT * FROM payslips WHERE id = ? AND school_id = ?').get(req.params.id, req.params.schoolId);
   if (!payslip) return res.status(404).json({ error: 'not found' });
+
+  const teacher = db.prepare('SELECT name FROM teachers WHERE id = ?').get(payslip.teacher_id);
+  const label = `${teacher?.name || '未知教師'} ${payslip.issued_date} 薪資條`;
+  addToTrash(req.params.schoolId, 'payslip', label, capturePayslip(req.params.id), req.user.id, { teacherId: payslip.teacher_id });
 
   db.prepare('DELETE FROM ledger_entries WHERE related_payslip_id = ?').run(req.params.id);
   db.prepare('DELETE FROM payslips WHERE id = ?').run(req.params.id);

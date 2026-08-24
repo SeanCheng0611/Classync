@@ -1,15 +1,17 @@
 import { useEffect, useState, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
 import { subscribeSchool } from '../socket';
-import { WEEKDAY_LABELS, slotToTime, timeToSlot, slotRangeLabel, todayStr, hoursToDurationSlots, durationHoursBetween } from '../lib/time';
+import { WEEKDAY_LABELS, slotToTime, timeToSlot, slotRangeLabel, todayStr, hoursToDurationSlots, durationHoursBetween, addHoursToTime } from '../lib/time';
 import TimeInput from '../components/TimeInput';
 import SubjectSelect from '../components/SubjectSelect';
 import SearchSelect from '../components/SearchSelect';
-import { defaultPriceForGrade } from '../lib/pricing';
+import GroupStudentSelect from '../components/GroupStudentSelect';
+import { sessionTypeLabel, sessionTypeColor, leaveColor } from '../lib/sessionType';
 
 function emptyAddClassForm() {
-  return { teacher_id: '', subject: '', student_id: '', date: todayStr(), start_time: '', end_time: '', unit_price: 0 };
+  return { teacher_id: '', subject: '', entries: [{ student_id: '', unit_price: 0 }], date: todayStr(), start_time: '', end_time: '' };
 }
 
 function recordKey(sessionId, personId) {
@@ -40,7 +42,7 @@ function addDays(dateStr, days) {
 }
 
 export default function Schedule() {
-  const { currentSchoolId, currentMembership } = useAuth();
+  const { currentSchoolId, currentMembership, schoolSettings } = useAuth();
   const isAdmin = ['admin', 'front_desk'].includes(currentMembership?.role);
 
   const [weekStart, setWeekStart] = useState(weekStartOf(todayStr()));
@@ -50,6 +52,13 @@ export default function Schedule() {
   const [students, setStudents] = useState([]);
   const [school, setSchool] = useState(null);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(''), 2500);
+    return () => clearTimeout(timer);
+  }, [notice]);
 
   const [showAddClass, setShowAddClass] = useState(false);
   const [addClassForm, setAddClassForm] = useState(emptyAddClassForm);
@@ -112,16 +121,6 @@ export default function Schedule() {
   const teacherName = (id) => teachers.find((t) => t.id === id)?.name || '未知';
   const studentSummary = (sessionStudents) => sessionStudents.map((s) => s.name).join(', ');
 
-  // 選擇學生時，依其年級帶入補習班設定的單堂預設金額（尚未手動調整過才帶入，避免覆蓋使用者已輸入的值）
-  useEffect(() => {
-    if (!school || !addClassForm.student_id) return;
-    const student = students.find((s) => s.id === addClassForm.student_id);
-    if (!student) return;
-    const price = defaultPriceForGrade(school, student.grade);
-    setAddClassForm((f) => (f.unit_price === 0 ? { ...f, unit_price: price } : f));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [school, addClassForm.student_id, students]);
-
   const submitAddClass = async (e) => {
     e.preventDefault();
     setError('');
@@ -129,8 +128,9 @@ export default function Schedule() {
       setError('請選擇科目');
       return;
     }
-    if (!addClassForm.student_id) {
-      setError('請選擇學生');
+    const chosenEntries = addClassForm.entries.filter((entry) => entry.student_id);
+    if (chosenEntries.length === 0) {
+      setError('請至少選擇一位學生');
       return;
     }
     if (!addClassForm.teacher_id) {
@@ -150,10 +150,11 @@ export default function Schedule() {
         session_date: addClassForm.date,
         start_slot: timeToSlot(addClassForm.start_time),
         duration_slots: hoursToDurationSlots(hours),
-        students: [{ student_id: addClassForm.student_id, unit_price: Number(addClassForm.unit_price) || 0 }],
+        students: chosenEntries.map((entry) => ({ student_id: entry.student_id, unit_price: Number(entry.unit_price) || 0 })),
       });
       setShowAddClass(false);
       setAddClassForm(emptyAddClassForm());
+      setNotice('加課成功');
       load();
     } catch (err) {
       setError(err.message);
@@ -238,10 +239,20 @@ export default function Schedule() {
   const isMakeupArranged = (session) =>
     session.students.some((s) => records[recordKey(session.id, s.id)]?.makeup_arranged);
 
+  // 同一時段內的排序：固定課 > 調課 > 加課 > 請假（已全部請假的排最後，不論原本類型）
+  const sessionSortRank = (session) => {
+    if (isAllOnLeave(session)) return 3;
+    if (session.type === 'regular') return 0;
+    if (session.type === 'makeup') return 1;
+    return 2;
+  };
+
   const byDate = weekDates.map((date) => ({
     date,
     weekday: new Date(`${date}T00:00:00`).getDay(),
-    items: sessions.filter((s) => s.session_date === date).sort((a, b) => a.start_slot - b.start_slot),
+    items: sessions
+      .filter((s) => s.session_date === date)
+      .sort((a, b) => a.start_slot - b.start_slot || sessionSortRank(a) - sessionSortRank(b)),
   }));
 
   return (
@@ -253,9 +264,26 @@ export default function Schedule() {
           <input type="date" value={weekStart} onChange={(e) => setWeekStart(weekStartOf(e.target.value))} />
           <button onClick={() => setWeekStart(addDays(weekStart, 7))}>下一週 →</button>
           {isAdmin && (
-            <button onClick={() => setShowAddClass((v) => !v)}>
+            <button
+              onClick={() => {
+                setShowAddClass((v) => {
+                  const next = !v;
+                  if (next) {
+                    setAddClassForm((f) => ({
+                      ...f,
+                      start_time: f.start_time || schoolSettings?.time_picker_range_start || '',
+                      end_time: f.end_time || schoolSettings?.time_picker_range_end || '',
+                    }));
+                  }
+                  return next;
+                });
+              }}
+            >
               {showAddClass ? '取消加課' : '+ 加課'}
             </button>
+          )}
+          {currentMembership?.role === 'admin' && (
+            <Link to="/schedule/trash"><button type="button">回收桶</button></Link>
           )}
         </div>
       </div>
@@ -285,20 +313,25 @@ export default function Schedule() {
                     <div>
                       <div>{slotRangeLabel(session.start_slot, session.duration_slots)}</div>
                       <div>{session.subject} - {teacherName(session.teacher_id)}</div>
-                      {(session.type !== 'regular' || grayedOut) && (
-                        <div
-                          style={{ fontSize: 11, color: grayedOut ? 'var(--text-muted)' : '#a60' }}
-                          title={
-                            session.type === 'makeup' && session.origin_session_date
-                              ? `調課自 ${session.origin_session_date} ${slotToTime(session.origin_start_slot)}`
-                              : undefined
-                          }
-                        >
-                          {grayedOut
-                            ? `[${isMakeupArranged(session) ? '已調課' : '已請假'}]`
-                            : `[${session.type === 'makeup' ? '調課' : '加課'}]`}
-                        </div>
-                      )}
+                      <div
+                        style={{
+                          fontSize: 11,
+                          color: grayedOut
+                            ? isMakeupArranged(session)
+                              ? sessionTypeColor({ type: 'makeup' }, schoolSettings)
+                              : leaveColor(schoolSettings)
+                            : sessionTypeColor(session, schoolSettings),
+                        }}
+                        title={
+                          session.type === 'makeup' && session.origin_session_date
+                            ? `調課自 ${session.origin_session_date} ${slotToTime(session.origin_start_slot)}`
+                            : undefined
+                        }
+                      >
+                        {grayedOut
+                          ? `[${isMakeupArranged(session) ? '已調課' : '已請假'}]`
+                          : `[${sessionTypeLabel(session)}]`}
+                      </div>
                       <div style={{ color: 'var(--text-muted)' }}>{studentSummary(session.students)}</div>
                     </div>
                     {isAdmin && (
@@ -327,7 +360,13 @@ export default function Schedule() {
                               />
                               <TimeInput
                                 value={rescheduleForm.new_start_time}
-                                onChange={(v) => setRescheduleForm({ ...rescheduleForm, new_start_time: v })}
+                                onChange={(v) =>
+                                  setRescheduleForm({
+                                    ...rescheduleForm,
+                                    new_start_time: v,
+                                    new_end_time: addHoursToTime(v, schoolSettings?.default_class_duration_hours || 1.5),
+                                  })
+                                }
                               />
                               <TimeInput
                                 value={rescheduleForm.new_end_time}
@@ -369,10 +408,13 @@ export default function Schedule() {
         <form onSubmit={submitAddClass} style={{ marginTop: 24, maxWidth: 360, display: 'grid', gap: 8 }}>
           <h3>加課</h3>
           {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
-          <label>
-            學生
-            <SearchSelect options={students} value={addClassForm.student_id} onChange={(v) => setAddClassForm({ ...addClassForm, student_id: v })} />
-          </label>
+          <GroupStudentSelect
+            students={students}
+            school={school}
+            maxGroupSize={school?.group_class_max_students || 2}
+            entries={addClassForm.entries}
+            onChange={(entries) => setAddClassForm({ ...addClassForm, entries })}
+          />
           <label>
             科目
             <SubjectSelect value={addClassForm.subject} onChange={(v) => setAddClassForm({ ...addClassForm, subject: v })} />
@@ -388,7 +430,16 @@ export default function Schedule() {
           <div style={{ display: 'flex', gap: 8 }}>
             <label>
               開始時間
-              <TimeInput value={addClassForm.start_time} onChange={(v) => setAddClassForm({ ...addClassForm, start_time: v })} />
+              <TimeInput
+                value={addClassForm.start_time}
+                onChange={(v) =>
+                  setAddClassForm({
+                    ...addClassForm,
+                    start_time: v,
+                    end_time: addHoursToTime(v, schoolSettings?.default_class_duration_hours || 1.5),
+                  })
+                }
+              />
             </label>
             <label>
               結束時間
@@ -398,12 +449,27 @@ export default function Schedule() {
           <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 13 }}>
             總時長：{durationHoursBetween(addClassForm.start_time, addClassForm.end_time) || 0} 小時
           </p>
-          <label>
-            單堂價錢
-            <input type="number" value={addClassForm.unit_price} onChange={(e) => setAddClassForm({ ...addClassForm, unit_price: e.target.value })} />
-          </label>
           <div><button type="submit">送出</button></div>
         </form>
+      )}
+
+      {notice && (
+        <div
+          style={{
+            position: 'fixed',
+            bottom: 24,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            background: 'var(--accent)',
+            color: '#fff',
+            padding: '10px 20px',
+            borderRadius: 6,
+            boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
+            fontSize: 14,
+          }}
+        >
+          {notice}
+        </div>
       )}
     </div>
   );

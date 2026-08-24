@@ -1,15 +1,15 @@
 import { Fragment, useEffect, useState, useCallback } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { Link, useParams, useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
 import { subscribeSchool } from '../socket';
-import { slotRangeLabel, slotToTime } from '../lib/time';
+import { slotRangeLabel, slotToTime, todayStr } from '../lib/time';
 
 const STATUS_LABEL = { present: '出席', absent: '缺席', leave: '請假' };
 const TYPE_LABEL = { regular: '固定', makeup: '調課', extra: '加課' };
 
 function currentMonth() {
-  return new Date().toISOString().slice(0, 7);
+  return todayStr().slice(0, 7);
 }
 
 export default function InvoiceDetail() {
@@ -88,9 +88,8 @@ export default function InvoiceDetail() {
     });
   };
 
-  const selectableSessions = sessions.filter(
-    (s) => s.attendance_status === 'present' && !s.invoiced && !stagedIds.has(s.session_id)
-  );
+  // 不論日期到了沒或出缺勤狀態，都能勾選開立繳費單（教師薪資那邊的限制維持不變，見 PayslipDetail.jsx）
+  const selectableSessions = sessions.filter((s) => !s.invoiced && !stagedIds.has(s.session_id));
   const allSelected = selectableSessions.length > 0 && selectableSessions.every((s) => checked.has(s.session_id));
   const toggleSelectAll = () => {
     setChecked(allSelected ? new Set() : new Set(selectableSessions.map((s) => s.session_id)));
@@ -105,7 +104,10 @@ export default function InvoiceDetail() {
       ...toAdd.map((s) => ({
         session_id: s.session_id,
         session_date: s.session_date,
+        start_slot: s.start_slot,
+        duration_slots: s.duration_slots,
         subject: s.subject,
+        type: s.type,
         teacher_id: s.teacher_id,
         unit_price: s.unit_price,
       })),
@@ -161,7 +163,10 @@ export default function InvoiceDetail() {
   return (
     <div>
       <button onClick={() => navigate('/invoices')}>← 返回學生列表</button>
-      <h2 style={{ marginTop: 12 }}>{student.name} - 繳費單開立</h2>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12 }}>
+        <h2 style={{ margin: 0 }}>{student.name} - 繳費單開立</h2>
+        {isAdmin && <Link to="/invoices/trash"><button type="button">回收桶</button></Link>}
+      </div>
 
       {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
 
@@ -193,7 +198,7 @@ export default function InvoiceDetail() {
         <tbody>
           {sessions.map((s) => {
             const alreadyStaged = stagedIds.has(s.session_id);
-            const selectable = s.attendance_status === 'present' && !s.invoiced && !alreadyStaged;
+            const selectable = !s.invoiced && !alreadyStaged;
             return (
               <tr key={s.session_id} style={{ borderBottom: '1px solid var(--border)' }}>
                 <td>
@@ -241,8 +246,10 @@ export default function InvoiceDetail() {
         <thead>
           <tr style={{ textAlign: 'left', borderBottom: '2px solid var(--border-strong)' }}>
             <th>日期</th>
+            <th>時段</th>
             <th>科目</th>
             <th>教師</th>
+            <th>類型</th>
             <th>單堂價錢</th>
             <th></th>
           </tr>
@@ -251,14 +258,16 @@ export default function InvoiceDetail() {
           {staged.map((i) => (
             <tr key={i.session_id} style={{ borderBottom: '1px solid var(--border)' }}>
               <td>{i.session_date}</td>
+              <td>{slotRangeLabel(i.start_slot, i.duration_slots)}</td>
               <td>{i.subject}</td>
               <td>{teacherName(i.teacher_id)}</td>
+              <td>{TYPE_LABEL[i.type]}</td>
               <td>{i.unit_price}</td>
               <td><button onClick={() => removeStaged(i.session_id)}>刪除</button></td>
             </tr>
           ))}
           {staged.length === 0 && (
-            <tr><td colSpan={5} style={{ color: 'var(--text-muted)', padding: 12 }}>尚未加入任何課堂</td></tr>
+            <tr><td colSpan={7} style={{ color: 'var(--text-muted)', padding: 12 }}>尚未加入任何課堂</td></tr>
           )}
         </tbody>
       </table>
@@ -300,7 +309,9 @@ export default function InvoiceDetail() {
                       <thead>
                         <tr>
                           <th style={{ textAlign: 'left' }}>日期</th>
+                          <th style={{ textAlign: 'left' }}>時段</th>
                           <th style={{ textAlign: 'left' }}>科目</th>
+                          <th style={{ textAlign: 'left' }}>教師</th>
                           <th style={{ textAlign: 'left' }}>類型</th>
                           <th style={{ textAlign: 'left' }}>備註</th>
                           <th style={{ textAlign: 'left' }}>單堂價錢</th>
@@ -310,7 +321,9 @@ export default function InvoiceDetail() {
                         {expandedInvoice.items.map((it) => (
                           <tr key={it.id}>
                             <td>{it.session_date}</td>
+                            <td>{slotRangeLabel(it.start_slot, it.duration_slots)}</td>
                             <td>{it.subject}</td>
+                            <td>{teacherName(it.teacher_id)}</td>
                             <td>{TYPE_LABEL[it.type]}</td>
                             <td>
                               {it.type === 'makeup' && it.origin_session_date && (

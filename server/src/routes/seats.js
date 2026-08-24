@@ -30,8 +30,8 @@ seatsRouter.get('/', (req, res) => {
 // 安排（新增或更新）某一桌：每桌最多 1 位教師、最多 2 位學生；同時段不可將同一位教師/學生排到別桌
 seatsRouter.put('/:seatNumber', requireMembership(['admin', 'front_desk']), (req, res) => {
   const seatNumber = Number(req.params.seatNumber);
-  if (!Number.isInteger(seatNumber) || seatNumber < 1 || seatNumber > 13) {
-    return res.status(400).json({ error: 'seat_number 必須介於 1-13' });
+  if (!Number.isInteger(seatNumber) || seatNumber < 1) {
+    return res.status(400).json({ error: 'seat_number 必須是正整數' });
   }
   const { date, time_slot, teacher_id, student_ids } = req.body;
   if (!date || time_slot === undefined) {

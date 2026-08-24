@@ -65,3 +65,57 @@ export function findStudentSessionConflict(schoolId, studentId, date, startSlot,
     .all(schoolId, studentId, date, excludeSessionId || '');
   return rows.find((r) => overlaps(startSlot, durationSlots, r.start_slot, r.duration_slots)) || null;
 }
+
+// 檢查學生人數是否超過該補習班在「設定」子系統設定的一對多班級人數上限，超過回傳錯誤訊息（未超過回傳 null）
+export function checkGroupSizeLimit(schoolId, studentCount) {
+  const school = db.prepare('SELECT group_class_max_students FROM schools WHERE id = ?').get(schoolId);
+  const max = school?.group_class_max_students ?? 2;
+  if (studentCount > max) return `這堂課學生人數（${studentCount}）超過設定上限（一對 ${max}）`;
+  return null;
+}
+
+// 通用時間區間扣除：從 [startSlot, endSlot) 扣掉每一段 busyRanges 重疊的部分，回傳剩下的區段（可能拆成多段，也可能是空陣列）；
+// 新增教師行政時段時用來自動避開該教師已經有學生的課堂時段
+export function subtractBusyRanges(startSlot, endSlot, busyRanges) {
+  let free = [[startSlot, endSlot]];
+  for (const [busyStart, busyEnd] of busyRanges) {
+    const next = [];
+    for (const [freeStart, freeEnd] of free) {
+      if (busyEnd <= freeStart || busyStart >= freeEnd) {
+        next.push([freeStart, freeEnd]);
+        continue;
+      }
+      if (busyStart > freeStart) next.push([freeStart, busyStart]);
+      if (busyEnd < freeEnd) next.push([busyEnd, freeEnd]);
+    }
+    free = next;
+  }
+  return free.filter(([s, e]) => e > s);
+}
+
+// 教師在指定日期、已經有學生的課堂時段（固定課展開、加課、調課皆算），用來讓新增行政時段時自動避開
+export function findTeacherTeachingRangesOnDate(schoolId, teacherId, date) {
+  ensureSessionsForDate(schoolId, date);
+  const rows = db
+    .prepare(
+      `SELECT cs.start_slot, cs.duration_slots FROM class_sessions cs
+       WHERE cs.school_id = ? AND cs.teacher_id = ? AND cs.session_date = ? AND cs.cancelled = 0
+       AND EXISTS (SELECT 1 FROM session_students ss WHERE ss.session_id = cs.id)`
+    )
+    .all(schoolId, teacherId, date);
+  return rows.map((r) => [r.start_slot, r.start_slot + r.duration_slots]);
+}
+
+// 教師在指定星期、已經有學生的固定課樣板時段，且生效區間與 [activeFrom, activeUntil] 重疊，用來讓新增固定行政時段時自動避開
+export function findTeacherTeachingRangesOnWeekday(schoolId, teacherId, weekday, activeFrom, activeUntil) {
+  const rows = db
+    .prepare(
+      `SELECT st.start_slot, st.duration_slots, st.active_from, st.active_until FROM schedule_templates st
+       WHERE st.school_id = ? AND st.teacher_id = ? AND st.weekday = ?
+       AND EXISTS (SELECT 1 FROM template_students ts WHERE ts.template_id = st.id)`
+    )
+    .all(schoolId, teacherId, weekday);
+  return rows
+    .filter((r) => activeRangesOverlap(activeFrom, activeUntil, r.active_from, r.active_until))
+    .map((r) => [r.start_slot, r.start_slot + r.duration_slots]);
+}

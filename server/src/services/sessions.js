@@ -26,8 +26,8 @@ export function ensureSessionsForDate(schoolId, dateStr) {
 
     const sessionId = nanoid();
     db.prepare(
-      `INSERT INTO class_sessions (id, school_id, template_id, teacher_id, subject, session_date, start_slot, duration_slots, type)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'regular')`
+      `INSERT INTO class_sessions (id, school_id, template_id, teacher_id, subject, session_date, start_slot, duration_slots, type, rate_override)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'regular', ?)`
     ).run(
       sessionId,
       schoolId,
@@ -36,7 +36,8 @@ export function ensureSessionsForDate(schoolId, dateStr) {
       template.subject,
       dateStr,
       template.start_slot,
-      template.duration_slots
+      template.duration_slots,
+      template.rate_override ?? null
     );
 
     const students = db

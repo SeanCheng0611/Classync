@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
 import { subscribeSchool } from '../socket';
@@ -111,7 +112,10 @@ export default function Members() {
 
   return (
     <div>
-      <h2>成員管理</h2>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <h2 style={{ margin: 0 }}>成員管理</h2>
+        <Link to="/members/trash"><button type="button">回收桶</button></Link>
+      </div>
       {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
 
       <h3>產生一次性邀請碼</h3>

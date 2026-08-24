@@ -9,6 +9,23 @@ CREATE TABLE IF NOT EXISTS schools (
   default_price_grade_1_6 INTEGER NOT NULL DEFAULT 1180,
   default_price_grade_7_9 INTEGER NOT NULL DEFAULT 1180,
   default_price_grade_10_12 INTEGER NOT NULL DEFAULT 1480,
+  -- 座位系統版面：一個 JSON 二維陣列，每個內層陣列是一橫排的座位編號（每排最多 4 個），用於座位頁的拖曳排版
+  seat_layout TEXT NOT NULL DEFAULT '[[1,2,3,4],[5,6,7,8],[9,10,11],[12,13]]',
+  -- 記事本分類：內建預設分類（待辦/學生/教師/生活/雜項）被使用者刪除後記在這裡（JSON 字串陣列），避免下次仍被強制補回選單
+  removed_default_categories TEXT NOT NULL DEFAULT '[]',
+  -- 「設定」子系統：一對多班級（一位教師對多位學生）每堂課最多可排的學生數
+  group_class_max_students INTEGER NOT NULL DEFAULT 2,
+  -- 時間選單（TimeInput 下拉）優先顯示的時段範圍，只影響排序，不限制可選時間
+  time_picker_range_start TEXT NOT NULL DEFAULT '18:00',
+  time_picker_range_end TEXT NOT NULL DEFAULT '21:00',
+  -- 新增排課表單時，起始時間欄位改用手動輸入後，結束時間自動重算為「起始時間 + 這個時數」（小時，可半小時級距）
+  default_class_duration_hours REAL NOT NULL DEFAULT 1.5,
+  -- 新增固定課堂時，若未填結束月份，預設往後展開幾個月（含起始月份）
+  default_schedule_span_months INTEGER NOT NULL DEFAULT 4,
+  -- 科目選單（排課時的科目下拉選項），JSON 字串陣列，可在「設定」子系統增刪或恢復預設
+  subjects TEXT NOT NULL DEFAULT '["C","E","M","N","S","PHY","CHEM","HIST","GEO","CIV","AD","J"]',
+  -- 課表／點名子系統的課堂類型標籤顏色（固定課/加課/調課 各對應一個莫蘭迪色票代號），JSON 物件，可在「設定」子系統調整
+  type_colors TEXT NOT NULL DEFAULT '{"regular":"camel","extra":"green","makeup":"blue","leave":"red"}',
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -45,6 +62,8 @@ CREATE TABLE IF NOT EXISTS teachers (
   rate_grade_10_12 INTEGER NOT NULL DEFAULT 0,
   rate_admin INTEGER NOT NULL DEFAULT 0,
   note TEXT,
+  -- 彈性上課時段：固定星期一到六，每天最多一段起訖時間，JSON 物件 {"1":{"start":"09:00","end":"12:00"}, ...}（1=一...6=六，沒排的星期不會有 key）
+  flexible_schedule TEXT NOT NULL DEFAULT '{}',
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -78,6 +97,8 @@ CREATE TABLE IF NOT EXISTS schedule_templates (
   active_from TEXT NOT NULL DEFAULT (date('now')),
   active_until TEXT,
   note TEXT,
+  -- 這堂課薪資試算用的時薪覆寫值；留空則沿用教師檔案上對應級距（或行政）的時薪
+  rate_override INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -102,6 +123,8 @@ CREATE TABLE IF NOT EXISTS class_sessions (
   origin_session_id TEXT REFERENCES class_sessions(id) ON DELETE SET NULL, -- makeup 課回指原本被取消的那堂
   cancelled INTEGER NOT NULL DEFAULT 0, -- regular 類型刪除單一天時用軟刪除，避免樣板懶生成時又展開回來
   note TEXT,
+  -- 這堂課薪資試算用的時薪覆寫值；留空則沿用教師檔案上對應級距（或行政）的時薪
+  rate_override INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -145,7 +168,7 @@ CREATE TABLE IF NOT EXISTS seat_assignments (
   school_id TEXT NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
   seat_date TEXT NOT NULL,
   time_slot INTEGER NOT NULL, -- 半小時單位
-  seat_number INTEGER NOT NULL CHECK (seat_number BETWEEN 1 AND 13),
+  seat_number INTEGER NOT NULL CHECK (seat_number >= 1), -- 座位數量可由管理者透過座位版面新增，不再限制上限
   teacher_id TEXT REFERENCES teachers(id) ON DELETE SET NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE (school_id, seat_date, time_slot, seat_number)
@@ -234,7 +257,7 @@ CREATE TABLE IF NOT EXISTS notes (
   id TEXT PRIMARY KEY,
   school_id TEXT NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
   author_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-  category TEXT NOT NULL DEFAULT '備註', -- 自由文字，使用者可自訂新分類
+  categories TEXT NOT NULL DEFAULT '["待辦"]', -- JSON 字串陣列，一則記事可以有多個分類；自由文字，使用者可自訂新分類
   done INTEGER NOT NULL DEFAULT 0,
   content TEXT NOT NULL,
   note_date TEXT NOT NULL DEFAULT (date('now')),
@@ -243,6 +266,21 @@ CREATE TABLE IF NOT EXISTS notes (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 回收桶：刪除操作先把資料（含關聯子資料）序列化存這裡再真的刪除，可從這裡復原；deleted_at 超過 14 天由背景排程自動清除
+CREATE TABLE IF NOT EXISTS trash (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+  entity_type TEXT NOT NULL,
+  label TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  -- 讓學生/教師詳細頁可以各自篩出「跟這個人有關」的回收桶項目；related_student_ids 是 JSON 字串陣列（課堂可能有多位學生）
+  related_student_ids TEXT NOT NULL DEFAULT '[]',
+  related_teacher_id TEXT,
+  deleted_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  deleted_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_trash_school ON trash(school_id, deleted_at);
 
 CREATE INDEX IF NOT EXISTS idx_students_school ON students(school_id);
 CREATE INDEX IF NOT EXISTS idx_teachers_school ON teachers(school_id);

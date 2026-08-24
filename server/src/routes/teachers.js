@@ -5,26 +5,43 @@ import { requireMembership } from '../auth/middleware.js';
 import { broadcastChange } from '../realtime/index.js';
 import { calcTeacherSalary } from '../services/finance.js';
 import { ensureSessionsForRange } from '../services/sessions.js';
+import { addToTrash, captureTeacher } from '../services/trash.js';
+import { sortByName } from '../services/nameSort.js';
 
 export const teachersRouter = Router({ mergeParams: true });
 teachersRouter.use(requireMembership());
 
 function serialize(row) {
-  return { ...row, subjects: JSON.parse(row.subjects || '[]') };
+  return { ...row, subjects: JSON.parse(row.subjects || '[]'), flexible_schedule: JSON.parse(row.flexible_schedule || '{}') };
 }
 
-// 依編號排序（編號視為數字排序，沒有編號的排在最後，再依姓名排序）
-const ORDER_BY_TEACHER_NO = "ORDER BY (teacher_no IS NULL OR teacher_no = ''), CAST(teacher_no AS INTEGER), name";
+const HHMM_RE = /^\d{2}:\d{2}$/;
+
+// 彈性上課時段涵蓋一週七天（0=日 ~ 6=六），每天最多一段起訖時間；忽略格式不對或起訖顛倒的天數
+function normalizeFlexibleSchedule(input) {
+  if (!input || typeof input !== 'object') return {};
+  const result = {};
+  for (let weekday = 0; weekday <= 6; weekday++) {
+    const slot = input[weekday] ?? input[String(weekday)];
+    if (!slot) continue;
+    const start = typeof slot.start === 'string' ? slot.start.trim() : '';
+    const end = typeof slot.end === 'string' ? slot.end.trim() : '';
+    if (!HHMM_RE.test(start) || !HHMM_RE.test(end) || end <= start) continue;
+    result[weekday] = { start, end };
+  }
+  return result;
+}
 
 // 教師只能查看自己的教師檔案（唯讀），管理者可查看全部
+// 依姓名筆劃排序，不用加入時間；前端列表的「編號」欄位依這個順序從 1 編起，純顯示用不寫回資料庫
 teachersRouter.get('/', (req, res) => {
   const rows =
     req.membership.role !== 'teacher'
-      ? db.prepare(`SELECT * FROM teachers WHERE school_id = ? ${ORDER_BY_TEACHER_NO}`).all(req.params.schoolId)
+      ? db.prepare('SELECT * FROM teachers WHERE school_id = ?').all(req.params.schoolId)
       : db
           .prepare('SELECT * FROM teachers WHERE school_id = ? AND id = ?')
           .all(req.params.schoolId, req.membership.teacher_id || '');
-  res.json(rows.map(serialize));
+  res.json(sortByName(rows).map(serialize));
 });
 
 teachersRouter.get('/:id', (req, res) => {
@@ -58,7 +75,6 @@ teachersRouter.get('/:id/sessions', (req, res) => {
 
 teachersRouter.post('/', requireMembership(['admin', 'front_desk']), (req, res) => {
   const {
-    teacher_no,
     name,
     subjects,
     rate_grade_1_6,
@@ -66,33 +82,28 @@ teachersRouter.post('/', requireMembership(['admin', 'front_desk']), (req, res) 
     rate_grade_10_12,
     rate_admin,
     note,
+    flexible_schedule,
   } = req.body;
   if (!name) return res.status(400).json({ error: 'name required' });
 
-  // 編號不可重複（同一補習班內），姓名重複則不擋，只在回傳結果中提醒
-  if (teacher_no) {
-    const dupNo = db
-      .prepare('SELECT id FROM teachers WHERE school_id = ? AND teacher_no = ?')
-      .get(req.params.schoolId, teacher_no);
-    if (dupNo) return res.status(409).json({ error: `編號「${teacher_no}」已存在，請確認編號是否重複` });
-  }
+  // 姓名重複不擋，只在回傳結果中提醒（前端匯入/新增流程改成在送出前先跳視窗詢問，這裡只當保險）
   const dupName = db.prepare('SELECT id FROM teachers WHERE school_id = ? AND name = ?').get(req.params.schoolId, name);
 
   const id = nanoid();
   db.prepare(
-    `INSERT INTO teachers (id, school_id, teacher_no, name, subjects, rate_grade_1_6, rate_grade_7_9, rate_grade_10_12, rate_admin, note)
+    `INSERT INTO teachers (id, school_id, name, subjects, rate_grade_1_6, rate_grade_7_9, rate_grade_10_12, rate_admin, note, flexible_schedule)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     req.params.schoolId,
-    teacher_no || null,
     name,
     JSON.stringify(subjects || []),
     rate_grade_1_6 || 0,
     rate_grade_7_9 || 0,
     rate_grade_10_12 || 0,
     rate_admin || 0,
-    note || null
+    note || null,
+    JSON.stringify(normalizeFlexibleSchedule(flexible_schedule))
   );
 
   broadcastChange(req.params.schoolId, 'teachers');
@@ -106,7 +117,6 @@ teachersRouter.put('/:id', requireMembership(['admin', 'front_desk']), (req, res
   if (!existing) return res.status(404).json({ error: 'not found' });
 
   const {
-    teacher_no = existing.teacher_no,
     name = existing.name,
     subjects = JSON.parse(existing.subjects),
     rate_grade_1_6 = existing.rate_grade_1_6,
@@ -115,23 +125,17 @@ teachersRouter.put('/:id', requireMembership(['admin', 'front_desk']), (req, res
     rate_admin = existing.rate_admin,
     note = existing.note,
     status = existing.status,
+    flexible_schedule = JSON.parse(existing.flexible_schedule || '{}'),
   } = req.body;
 
-  if (teacher_no) {
-    const dupNo = db
-      .prepare('SELECT id FROM teachers WHERE school_id = ? AND teacher_no = ? AND id != ?')
-      .get(req.params.schoolId, teacher_no, req.params.id);
-    if (dupNo) return res.status(409).json({ error: `編號「${teacher_no}」已存在，請確認編號是否重複` });
-  }
   const dupName = db
     .prepare('SELECT id FROM teachers WHERE school_id = ? AND name = ? AND id != ?')
     .get(req.params.schoolId, name, req.params.id);
 
   db.prepare(
-    `UPDATE teachers SET teacher_no=?, name=?, subjects=?, rate_grade_1_6=?, rate_grade_7_9=?, rate_grade_10_12=?, rate_admin=?, note=?, status=?, updated_at=datetime('now')
+    `UPDATE teachers SET name=?, subjects=?, rate_grade_1_6=?, rate_grade_7_9=?, rate_grade_10_12=?, rate_admin=?, note=?, status=?, flexible_schedule=?, updated_at=datetime('now')
      WHERE id = ?`
   ).run(
-    teacher_no,
     name,
     JSON.stringify(subjects),
     rate_grade_1_6,
@@ -140,6 +144,7 @@ teachersRouter.put('/:id', requireMembership(['admin', 'front_desk']), (req, res
     rate_admin,
     note,
     status,
+    JSON.stringify(normalizeFlexibleSchedule(flexible_schedule)),
     req.params.id
   );
 
@@ -147,7 +152,32 @@ teachersRouter.put('/:id', requireMembership(['admin', 'front_desk']), (req, res
   res.json({ ...serialize(db.prepare('SELECT * FROM teachers WHERE id = ?').get(req.params.id)), duplicate_name: !!dupName });
 });
 
+// 彈性上課時段是教師唯一可以自己修改的欄位：管理者/櫃台可改任何教師，教師本人只能改自己的
+teachersRouter.put('/:id/flexible-schedule', requireMembership(['admin', 'front_desk', 'teacher']), (req, res) => {
+  if (req.membership.role === 'teacher' && req.membership.teacher_id !== req.params.id) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const existing = db
+    .prepare('SELECT * FROM teachers WHERE school_id = ? AND id = ?')
+    .get(req.params.schoolId, req.params.id);
+  if (!existing) return res.status(404).json({ error: 'not found' });
+
+  const flexibleSchedule = normalizeFlexibleSchedule(req.body.flexible_schedule);
+  db.prepare(`UPDATE teachers SET flexible_schedule = ?, updated_at = datetime('now') WHERE id = ?`).run(
+    JSON.stringify(flexibleSchedule),
+    req.params.id
+  );
+
+  broadcastChange(req.params.schoolId, 'teachers');
+  res.json(serialize(db.prepare('SELECT * FROM teachers WHERE id = ?').get(req.params.id)));
+});
+
 teachersRouter.delete('/:id', requireMembership(['admin', 'front_desk']), (req, res) => {
+  const existing = db.prepare('SELECT * FROM teachers WHERE school_id = ? AND id = ?').get(req.params.schoolId, req.params.id);
+  if (!existing) return res.status(204).end();
+
+  addToTrash(req.params.schoolId, 'teacher', existing.name, captureTeacher(req.params.id), req.user.id);
+
   db.prepare('DELETE FROM teachers WHERE school_id = ? AND id = ?').run(
     req.params.schoolId,
     req.params.id

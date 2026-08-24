@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { TIME_OPTIONS } from '../lib/time';
+import { DROPDOWN_TIME_OPTIONS } from '../lib/time';
 
 // 輸入為主、選擇為輔：可直接輸入 HH:MM（打完兩位數字會自動補冒號），也可點開下拉選單挑選
 // 下拉選單固定顯示全部半小時級距選項，不會因為已輸入文字而被瀏覽器過濾
@@ -57,7 +57,7 @@ export default function TimeInput({ value, onChange, style, ...rest }) {
             width: 90,
           }}
         >
-          {TIME_OPTIONS.map((t) => (
+          {DROPDOWN_TIME_OPTIONS.map((t) => (
             <li key={t}>
               <button
                 type="button"

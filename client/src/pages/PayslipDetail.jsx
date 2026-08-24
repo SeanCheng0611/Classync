@@ -1,14 +1,14 @@
 import { Fragment, useEffect, useState, useCallback } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { Link, useParams, useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
 import { subscribeSchool } from '../socket';
-import { slotToTime } from '../lib/time';
+import { slotToTime, slotRangeLabel, todayStr } from '../lib/time';
 
 const TYPE_LABEL = { regular: '固定', makeup: '調課', extra: '加課' };
 
 function currentMonth() {
-  return new Date().toISOString().slice(0, 7);
+  return todayStr().slice(0, 7);
 }
 
 export default function PayslipDetail() {
@@ -84,7 +84,11 @@ export default function PayslipDetail() {
     });
   };
 
-  const selectableSessions = sessions.filter((s) => !s.issued && !stagedIds.has(s.session_id) && !s.fully_on_leave);
+  // 未來還沒發生的課堂、或還有學生尚未點名的課堂，都不能先開立薪資
+  const isFutureSession = (s) => s.session_date > todayStr();
+  const selectableSessions = sessions.filter(
+    (s) => !s.issued && !stagedIds.has(s.session_id) && !s.fully_on_leave && !isFutureSession(s) && !s.not_yet_marked
+  );
   const allSelected = selectableSessions.length > 0 && selectableSessions.every((s) => checked.has(s.session_id));
   const toggleSelectAll = () => {
     setChecked(allSelected ? new Set() : new Set(selectableSessions.map((s) => s.session_id)));
@@ -99,8 +103,11 @@ export default function PayslipDetail() {
       ...toAdd.map((s) => ({
         session_id: s.session_id,
         session_date: s.session_date,
+        start_slot: s.start_slot,
+        duration_slots: s.duration_slots,
         subject: s.subject,
         type: s.type,
+        is_admin: s.is_admin,
         student_names: s.student_names,
         hours: s.hours,
         rate: s.rate,
@@ -158,7 +165,10 @@ export default function PayslipDetail() {
   return (
     <div>
       <button onClick={() => navigate('/payslips')}>← 返回教師列表</button>
-      <h2 style={{ marginTop: 12 }}>{teacher.name} - 薪資條開立</h2>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12 }}>
+        <h2 style={{ margin: 0 }}>{teacher.name} - 薪資條開立</h2>
+        {isAdmin && <Link to="/payslips/trash"><button type="button">回收桶</button></Link>}
+      </div>
 
       {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
 
@@ -178,6 +188,7 @@ export default function PayslipDetail() {
               />
             </th>
             <th>日期</th>
+            <th>時段</th>
             <th>科目</th>
             <th>類型</th>
             <th>備註</th>
@@ -191,7 +202,7 @@ export default function PayslipDetail() {
         <tbody>
           {sessions.map((s) => {
             const alreadyStaged = stagedIds.has(s.session_id);
-            const selectable = !s.issued && !alreadyStaged && !s.fully_on_leave;
+            const selectable = !s.issued && !alreadyStaged && !s.fully_on_leave && !isFutureSession(s) && !s.not_yet_marked;
             return (
               <tr
                 key={s.session_id}
@@ -215,6 +226,7 @@ export default function PayslipDetail() {
                   )}
                 </td>
                 <td>{s.session_date}</td>
+                <td>{slotRangeLabel(s.start_slot, s.duration_slots)}</td>
                 <td>{s.subject}</td>
                 <td>{TYPE_LABEL[s.type]}</td>
                 <td>
@@ -225,7 +237,15 @@ export default function PayslipDetail() {
                   )}
                 </td>
                 <td>{s.is_admin ? '行政' : s.student_names.join('、')}</td>
-                <td>{s.fully_on_leave ? (s.leave_is_makeup ? '已調課' : '已請假') : '-'}</td>
+                <td>
+                  {s.fully_on_leave
+                    ? s.leave_is_makeup ? '已調課' : '已請假'
+                    : isFutureSession(s)
+                    ? '尚未發生'
+                    : s.not_yet_marked
+                    ? '尚未點名'
+                    : '-'}
+                </td>
                 <td>{s.hours}</td>
                 <td>{s.rate}</td>
                 <td>{s.pay}</td>
@@ -233,7 +253,7 @@ export default function PayslipDetail() {
             );
           })}
           {sessions.length === 0 && (
-            <tr><td colSpan={10} style={{ color: 'var(--text-muted)', padding: 12 }}>這個月無課堂紀錄</td></tr>
+            <tr><td colSpan={11} style={{ color: 'var(--text-muted)', padding: 12 }}>這個月無課堂紀錄</td></tr>
           )}
         </tbody>
       </table>
@@ -246,7 +266,10 @@ export default function PayslipDetail() {
         <thead>
           <tr style={{ textAlign: 'left', borderBottom: '2px solid var(--border-strong)' }}>
             <th>日期</th>
+            <th>時段</th>
             <th>科目</th>
+            <th>類型</th>
+            <th>學生</th>
             <th>時數</th>
             <th>金額</th>
             <th></th>
@@ -256,14 +279,17 @@ export default function PayslipDetail() {
           {staged.map((i) => (
             <tr key={i.session_id} style={{ borderBottom: '1px solid var(--border)' }}>
               <td>{i.session_date}</td>
+              <td>{slotRangeLabel(i.start_slot, i.duration_slots)}</td>
               <td>{i.subject}</td>
+              <td>{TYPE_LABEL[i.type]}</td>
+              <td>{i.is_admin ? '行政' : i.student_names.join('、')}</td>
               <td>{i.hours}</td>
               <td>{i.pay}</td>
               <td><button onClick={() => removeStaged(i.session_id)}>刪除</button></td>
             </tr>
           ))}
           {staged.length === 0 && (
-            <tr><td colSpan={5} style={{ color: 'var(--text-muted)', padding: 12 }}>尚未加入任何課堂</td></tr>
+            <tr><td colSpan={8} style={{ color: 'var(--text-muted)', padding: 12 }}>尚未加入任何課堂</td></tr>
           )}
         </tbody>
       </table>
@@ -305,9 +331,11 @@ export default function PayslipDetail() {
                       <thead>
                         <tr>
                           <th style={{ textAlign: 'left' }}>日期</th>
+                          <th style={{ textAlign: 'left' }}>時段</th>
                           <th style={{ textAlign: 'left' }}>科目</th>
                           <th style={{ textAlign: 'left' }}>類型</th>
                           <th style={{ textAlign: 'left' }}>備註</th>
+                          <th style={{ textAlign: 'left' }}>學生</th>
                           <th style={{ textAlign: 'left' }}>時數</th>
                           <th style={{ textAlign: 'left' }}>金額</th>
                         </tr>
@@ -316,6 +344,7 @@ export default function PayslipDetail() {
                         {expandedPayslip.items.map((it) => (
                           <tr key={it.id}>
                             <td>{it.session_date}</td>
+                            <td>{slotRangeLabel(it.start_slot, it.duration_slots)}</td>
                             <td>{it.subject}</td>
                             <td>{TYPE_LABEL[it.type]}</td>
                             <td>
@@ -325,6 +354,7 @@ export default function PayslipDetail() {
                                 </span>
                               )}
                             </td>
+                            <td>{it.is_admin ? '行政' : it.student_names.join('、')}</td>
                             <td>{it.hours}</td>
                             <td>{it.pay}</td>
                           </tr>

@@ -3,8 +3,9 @@ import ExcelJS from 'exceljs';
 import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
 import { subscribeSchool } from '../socket';
-import { slotRangeLabel, todayStr, timeToSlot, slotToTime, durationHoursBetween, hoursToDurationSlots } from '../lib/time';
+import { slotRangeLabel, todayStr, timeToSlot, slotToTime, durationHoursBetween, hoursToDurationSlots, addHoursToTime } from '../lib/time';
 import TimeInput from '../components/TimeInput';
+import { sessionTypeLabel, sessionTypeColor, leaveColor } from '../lib/sessionType';
 
 const EXPORT_FONT = { name: '辰宇落雁體 2.0 Thin', size: 16 };
 const EXPORT_BORDER = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
@@ -29,6 +30,7 @@ function StatusButtons({
   startReschedule,
   confirmReschedule,
 }) {
+  const { schoolSettings } = useAuth() || {};
   const record = records[recordKey(session.id, personId)];
 
   if (!isAdmin) {
@@ -48,7 +50,16 @@ function StatusButtons({
           value={rescheduleForm.new_date}
           onChange={(e) => setRescheduleForm({ ...rescheduleForm, new_date: e.target.value })}
         />
-        <TimeInput value={rescheduleForm.new_start_time} onChange={(v) => setRescheduleForm({ ...rescheduleForm, new_start_time: v })} />
+        <TimeInput
+          value={rescheduleForm.new_start_time}
+          onChange={(v) =>
+            setRescheduleForm({
+              ...rescheduleForm,
+              new_start_time: v,
+              new_end_time: addHoursToTime(v, schoolSettings?.default_class_duration_hours || 1.5),
+            })
+          }
+        />
         <span>-</span>
         <TimeInput value={rescheduleForm.new_end_time} onChange={(v) => setRescheduleForm({ ...rescheduleForm, new_end_time: v })} />
         <button onClick={() => confirmReschedule(session, personId)}>確認</button>
@@ -80,7 +91,7 @@ function StatusButtons({
 }
 
 export default function Attendance() {
-  const { currentSchoolId, currentMembership } = useAuth();
+  const { currentSchoolId, currentMembership, schoolSettings } = useAuth();
   const isAdmin = ['admin', 'front_desk'].includes(currentMembership?.role);
 
   const [date, setDate] = useState(todayStr());
@@ -265,6 +276,22 @@ export default function Attendance() {
     }
   };
 
+  // 排序：時間 > 固定課 > 調課 > 加課 > 請假（該生已請假/已調課的排最後，不論原本課堂類型）
+  const rowRank = (session, resolved) => {
+    if (resolved) return 3;
+    if (session.type === 'regular') return 0;
+    if (session.type === 'makeup') return 1;
+    return 2;
+  };
+  const sortedRows = sessions
+    .flatMap((session) => session.students.map((student) => ({ session, student })))
+    .sort((a, b) => {
+      if (a.session.start_slot !== b.session.start_slot) return a.session.start_slot - b.session.start_slot;
+      const resolvedA = records[recordKey(a.session.id, a.student.id)]?.status === 'leave';
+      const resolvedB = records[recordKey(b.session.id, b.student.id)]?.status === 'leave';
+      return rowRank(a.session, resolvedA) - rowRank(b.session, resolvedB);
+    });
+
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -281,22 +308,18 @@ export default function Attendance() {
 
       {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
 
-      <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 12 }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 12, tableLayout: 'fixed' }}>
         <thead>
           <tr style={{ textAlign: 'left', borderBottom: '2px solid var(--border-strong)' }}>
-            <th>時間</th>
-            <th>科目</th>
-            <th>教師</th>
-            <th>學生</th>
-            <th>出缺勤</th>
+            <th style={{ width: 110 }}>時間</th>
+            <th style={{ width: 100 }}>科目</th>
+            <th style={{ width: 100 }}>教師</th>
+            <th style={{ width: 100 }}>學生</th>
+            <th style={{ width: 220 }}>出缺勤</th>
           </tr>
         </thead>
         <tbody>
-          {sessions.flatMap((session) =>
-            session.students.length === 0 ? (
-              []
-            ) : (
-              session.students.map((student) => {
+          {sortedRows.map(({ session, student }) => {
                 const record = records[recordKey(session.id, student.id)];
                 const resolved = record?.status === 'leave';
                 return (
@@ -305,22 +328,26 @@ export default function Attendance() {
                   <td>
                     {session.subject}
                     {resolved ? (
-                      <span style={{ marginLeft: 4, fontSize: 11, color: 'var(--text-muted)' }}>
+                      <span
+                        style={{
+                          marginLeft: 4,
+                          fontSize: 11,
+                          color: record.makeup_arranged ? sessionTypeColor({ type: 'makeup' }, schoolSettings) : leaveColor(schoolSettings),
+                        }}
+                      >
                         [{record.makeup_arranged ? '已調課' : '已請假'}]
                       </span>
                     ) : (
-                      session.type !== 'regular' && (
-                        <span
-                          style={{ marginLeft: 4, fontSize: 11, color: '#a60' }}
-                          title={
-                            session.type === 'makeup' && session.origin_session_date
-                              ? `調課自 ${session.origin_session_date} ${slotToTime(session.origin_start_slot)}`
-                              : undefined
-                          }
-                        >
-                          [{session.type === 'makeup' ? '調課' : '加課'}]
-                        </span>
-                      )
+                      <span
+                        style={{ marginLeft: 4, fontSize: 11, color: sessionTypeColor(session, schoolSettings) }}
+                        title={
+                          session.type === 'makeup' && session.origin_session_date
+                            ? `調課自 ${session.origin_session_date} ${slotToTime(session.origin_start_slot)}`
+                            : undefined
+                        }
+                      >
+                        [{sessionTypeLabel(session)}]
+                      </span>
                     )}
                   </td>
                   <td>{teacherName(session.teacher_id)}</td>
@@ -343,9 +370,7 @@ export default function Attendance() {
                   </td>
                 </tr>
                 );
-              })
-            )
-          )}
+          })}
           {sessions.every((s) => s.students.length === 0) && (
             <tr>
               <td colSpan={5} style={{ color: 'var(--text-muted)', padding: 12 }}>

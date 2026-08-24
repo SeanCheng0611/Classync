@@ -1,17 +1,18 @@
 import { NavLink, Outlet } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { useScrollMemory } from '../lib/useScrollMemory';
 
 const navLinkClass = ({ isActive }) => `nav-link${isActive ? ' nav-link-active' : ''}`;
 
 export default function Layout() {
   const { user, memberships, currentSchoolId, currentMembership, setCurrentSchoolId, logout } = useAuth();
+  useScrollMemory();
 
   return (
     <div>
       <header className="app-header">
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <strong>{currentMembership?.school_name}</strong>
-          {memberships.length > 1 && (
+          {memberships.length > 1 ? (
             <select
               value={currentSchoolId || ''}
               onChange={(e) => setCurrentSchoolId(e.target.value)}
@@ -22,6 +23,8 @@ export default function Layout() {
                 </option>
               ))}
             </select>
+          ) : (
+            <strong>{currentMembership?.school_name}</strong>
           )}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -43,6 +46,7 @@ export default function Layout() {
             <NavLink to="/finance" className={navLinkClass}>收支統計</NavLink>
             <NavLink to="/notes" className={navLinkClass}>記事本</NavLink>
             <NavLink to="/members" className={navLinkClass}>成員管理</NavLink>
+            <NavLink to="/settings" className={navLinkClass}>設定</NavLink>
           </>
         )}
         <NavLink to="/schools" className={navLinkClass}>切換補習班</NavLink>

@@ -5,6 +5,7 @@ import { requireMembership } from '../auth/middleware.js';
 import { broadcastChange } from '../realtime/index.js';
 import { ensureSessionsForRange } from '../services/sessions.js';
 import { monthRange } from '../services/finance.js';
+import { addToTrash, captureInvoice } from '../services/trash.js';
 
 export const invoicesRouter = Router({ mergeParams: true });
 invoicesRouter.use(requireMembership(['admin']));
@@ -54,7 +55,7 @@ invoicesRouter.get('/', (req, res) => {
   res.json(rows);
 });
 
-// 開立繳費單：從指定的課堂（須為該學生、已出席、尚未開立過）挑選建立，可跨月
+// 開立繳費單：從指定的課堂（須為該學生、尚未開立過）挑選建立，可跨月；不論日期到了沒或出缺勤狀態都能開立
 invoicesRouter.post('/', (req, res) => {
   const { student_id, session_ids, note } = req.body;
   if (!student_id || !Array.isArray(session_ids) || session_ids.length === 0) {
@@ -68,17 +69,13 @@ invoicesRouter.post('/', (req, res) => {
   for (const sessionId of session_ids) {
     const row = db
       .prepare(
-        `SELECT cs.id, cs.session_date, cs.subject, ss.unit_price, ar.status as attendance_status
+        `SELECT cs.id, cs.session_date, cs.subject, ss.unit_price
          FROM class_sessions cs
          JOIN session_students ss ON ss.session_id = cs.id AND ss.student_id = ?
-         LEFT JOIN attendance_records ar ON ar.session_id = cs.id AND ar.person_type = 'student' AND ar.person_id = ?
          WHERE cs.id = ? AND cs.school_id = ?`
       )
-      .get(student_id, student_id, sessionId, req.params.schoolId);
+      .get(student_id, sessionId, req.params.schoolId);
     if (!row) return res.status(400).json({ error: `課堂不存在或不屬於此學生（${sessionId}）` });
-    if (row.attendance_status !== 'present') {
-      return res.status(400).json({ error: `${row.session_date} ${row.subject} 尚未確認出席，無法開立` });
-    }
     const already = db.prepare('SELECT 1 FROM invoice_items WHERE session_id = ?').get(sessionId);
     if (already) {
       return res.status(409).json({ error: `${row.session_date} ${row.subject} 已開立過繳費單，無法重複開立` });
@@ -106,7 +103,7 @@ invoicesRouter.get('/:id', (req, res) => {
 
   const items = db
     .prepare(
-      `SELECT ii.id, ii.unit_price, cs.session_date, cs.subject, cs.type,
+      `SELECT ii.id, ii.unit_price, cs.session_date, cs.subject, cs.type, cs.start_slot, cs.duration_slots, cs.teacher_id,
               origin.session_date as origin_session_date, origin.start_slot as origin_start_slot
        FROM invoice_items ii JOIN class_sessions cs ON cs.id = ii.session_id
        LEFT JOIN class_sessions origin ON origin.id = cs.origin_session_id
@@ -121,6 +118,10 @@ invoicesRouter.get('/:id', (req, res) => {
 invoicesRouter.delete('/:id', (req, res) => {
   const invoice = db.prepare('SELECT * FROM invoices WHERE id = ? AND school_id = ?').get(req.params.id, req.params.schoolId);
   if (!invoice) return res.status(404).json({ error: 'not found' });
+
+  const student = db.prepare('SELECT name FROM students WHERE id = ?').get(invoice.student_id);
+  const label = `${student?.name || '未知學生'} ${invoice.issued_date} 繳費單`;
+  addToTrash(req.params.schoolId, 'invoice', label, captureInvoice(req.params.id), req.user.id, { studentIds: [invoice.student_id] });
 
   db.prepare('DELETE FROM ledger_entries WHERE related_invoice_id = ?').run(req.params.id);
   db.prepare('DELETE FROM invoices WHERE id = ?').run(req.params.id);

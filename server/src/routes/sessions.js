@@ -4,8 +4,15 @@ import { db } from '../db/index.js';
 import { requireMembership } from '../auth/middleware.js';
 import { broadcastChange } from '../realtime/index.js';
 import { ensureSessionsForDate, serializeSession } from '../services/sessions.js';
-import { findTeacherSessionConflict, findStudentSessionConflict } from '../services/conflicts.js';
+import {
+  findTeacherSessionConflict,
+  findStudentSessionConflict,
+  checkGroupSizeLimit,
+  subtractBusyRanges,
+  findTeacherTeachingRangesOnDate,
+} from '../services/conflicts.js';
 import { slotRangeLabel } from '../services/timeLabels.js';
+import { addToTrash, captureSession } from '../services/trash.js';
 
 export const sessionsRouter = Router({ mergeParams: true });
 sessionsRouter.use(requireMembership());
@@ -66,6 +73,7 @@ sessionsRouter.post('/', requireMembership(['admin', 'front_desk']), (req, res) 
     type,
     origin_session_id,
     note,
+    rate_override,
   } = req.body;
   const students = normalizeStudents(req.body);
 
@@ -76,47 +84,76 @@ sessionsRouter.post('/', requireMembership(['admin', 'front_desk']), (req, res) 
     return res.status(400).json({ error: "type must be 'makeup' or 'extra'" });
   }
 
-  const conflictMsg = checkSessionConflicts(req.params.schoolId, {
-    teacherId: teacher_id,
-    studentIds: students.map((s) => s.student_id),
-    date: session_date,
-    startSlot: start_slot,
-    durationSlots: duration_slots || 2,
-  });
-  if (conflictMsg) return res.status(409).json({ error: conflictMsg });
+  const capacityMsg = checkGroupSizeLimit(req.params.schoolId, students.length);
+  if (capacityMsg) return res.status(400).json({ error: capacityMsg });
 
-  const id = nanoid();
-  db.prepare(
-    `INSERT INTO class_sessions (id, school_id, teacher_id, subject, session_date, start_slot, duration_slots, type, origin_session_id, note)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id,
-    req.params.schoolId,
-    teacher_id,
-    subject,
-    session_date,
-    start_slot,
-    duration_slots || 2,
-    type,
-    origin_session_id || null,
-    note || null
-  );
+  const requestedDuration = duration_slots || 2;
+  let segments = [[start_slot, start_slot + requestedDuration]];
+  let autoAdjusted = false;
+
+  // 行政時段（無學生）新增時，自動避開該教師當天已經有學生的課堂時段，不需要手動閃開
+  if (students.length === 0) {
+    const busy = findTeacherTeachingRangesOnDate(req.params.schoolId, teacher_id, session_date);
+    const free = subtractBusyRanges(start_slot, start_slot + requestedDuration, busy);
+    if (free.length === 0) {
+      return res.status(409).json({ error: '教師該時段已被課堂佔滿，無法新增行政時段' });
+    }
+    if (free.length !== 1 || free[0][0] !== start_slot || free[0][1] !== start_slot + requestedDuration) {
+      autoAdjusted = true;
+    }
+    segments = free;
+  }
+
+  for (const [segStart, segEnd] of segments) {
+    const conflictMsg = checkSessionConflicts(req.params.schoolId, {
+      teacherId: teacher_id,
+      studentIds: students.map((s) => s.student_id),
+      date: session_date,
+      startSlot: segStart,
+      durationSlots: segEnd - segStart,
+    });
+    if (conflictMsg) return res.status(409).json({ error: conflictMsg });
+  }
 
   const insertStudent = db.prepare(
     'INSERT INTO session_students (session_id, student_id, unit_price) VALUES (?, ?, ?)'
   );
-  for (const { student_id, unit_price } of students) insertStudent.run(id, student_id, unit_price || 0);
+  const createdIds = [];
+  for (const [segStart, segEnd] of segments) {
+    const id = nanoid();
+    db.prepare(
+      `INSERT INTO class_sessions (id, school_id, teacher_id, subject, session_date, start_slot, duration_slots, type, origin_session_id, note, rate_override)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id,
+      req.params.schoolId,
+      teacher_id,
+      subject,
+      session_date,
+      segStart,
+      segEnd - segStart,
+      type,
+      origin_session_id || null,
+      note || null,
+      rate_override != null ? Number(rate_override) : null
+    );
+    for (const { student_id, unit_price } of students) insertStudent.run(id, student_id, unit_price || 0);
+    createdIds.push(id);
+  }
 
   if (origin_session_id && students.length > 0) {
     const studentIds = students.map((s) => s.student_id);
     db.prepare(
       `UPDATE attendance_records SET makeup_arranged = 1, makeup_session_id = ?
        WHERE session_id = ? AND person_type = 'student' AND person_id IN (${studentIds.map(() => '?').join(',')})`
-    ).run(id, origin_session_id, ...studentIds);
+    ).run(createdIds[0], origin_session_id, ...studentIds);
   }
 
   broadcastChange(req.params.schoolId, 'sessions');
-  res.status(201).json(serializeSession(db.prepare('SELECT * FROM class_sessions WHERE id = ?').get(id)));
+  res.status(201).json({
+    sessions: createdIds.map((sid) => serializeSession(db.prepare('SELECT * FROM class_sessions WHERE id = ?').get(sid))),
+    auto_adjusted: autoAdjusted,
+  });
 });
 
 sessionsRouter.put('/:id', requireMembership(['admin', 'front_desk']), (req, res) => {
@@ -132,6 +169,7 @@ sessionsRouter.put('/:id', requireMembership(['admin', 'front_desk']), (req, res
     start_slot = existing.start_slot,
     duration_slots = existing.duration_slots,
     note = existing.note,
+    rate_override = existing.rate_override,
   } = req.body;
 
   const studentsProvided = req.body.students !== undefined || req.body.student_ids !== undefined;
@@ -139,6 +177,9 @@ sessionsRouter.put('/:id', requireMembership(['admin', 'front_desk']), (req, res
   const studentIds = studentsProvided
     ? students.map((s) => s.student_id)
     : db.prepare('SELECT student_id FROM session_students WHERE session_id = ?').all(req.params.id).map((r) => r.student_id);
+
+  const capacityMsg = checkGroupSizeLimit(req.params.schoolId, studentIds.length);
+  if (capacityMsg) return res.status(400).json({ error: capacityMsg });
 
   const conflictMsg = checkSessionConflicts(req.params.schoolId, {
     teacherId: teacher_id,
@@ -151,9 +192,9 @@ sessionsRouter.put('/:id', requireMembership(['admin', 'front_desk']), (req, res
   if (conflictMsg) return res.status(409).json({ error: conflictMsg });
 
   db.prepare(
-    `UPDATE class_sessions SET teacher_id=?, subject=?, session_date=?, start_slot=?, duration_slots=?, note=?
+    `UPDATE class_sessions SET teacher_id=?, subject=?, session_date=?, start_slot=?, duration_slots=?, note=?, rate_override=?
      WHERE id = ?`
-  ).run(teacher_id, subject, session_date, start_slot, duration_slots, note, req.params.id);
+  ).run(teacher_id, subject, session_date, start_slot, duration_slots, note, rate_override != null ? Number(rate_override) : null, req.params.id);
 
   if (studentsProvided) {
     db.prepare('DELETE FROM session_students WHERE session_id = ?').run(req.params.id);
@@ -189,9 +230,16 @@ sessionsRouter.delete('/:id', requireMembership(['admin', 'front_desk']), (req, 
     return res.status(400).json({ error: '此堂已被調往較晚的時段，請先處理較晚的調課紀錄才能刪除' });
   }
 
+  const teacher = db.prepare('SELECT name FROM teachers WHERE id = ?').get(existing.teacher_id);
+  const label = `${existing.session_date} ${slotRangeLabel(existing.start_slot, existing.duration_slots)} ${existing.subject}（${teacher?.name || '未知教師'}）`;
+  const studentIds = db.prepare('SELECT student_id FROM session_students WHERE session_id = ?').all(req.params.id).map((r) => r.student_id);
+  const related = { studentIds, teacherId: existing.teacher_id };
+
   if (existing.type === 'regular') {
+    addToTrash(req.params.schoolId, 'session_cancelled', label, { sessionId: req.params.id }, req.user.id, related);
     db.prepare('UPDATE class_sessions SET cancelled = 1 WHERE id = ?').run(req.params.id);
   } else {
+    addToTrash(req.params.schoolId, 'session', label, captureSession(req.params.id), req.user.id, related);
     db.prepare('DELETE FROM class_sessions WHERE id = ?').run(req.params.id);
   }
 

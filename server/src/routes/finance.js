@@ -5,6 +5,7 @@ import { requireMembership } from '../auth/middleware.js';
 import { broadcastChange } from '../realtime/index.js';
 import { calcTeacherSalary, calcAllTeachersSalary, calcStudentTuition, calcStudentTuitionForMonth, monthRange, shiftMonth } from '../services/finance.js';
 import { ensureSessionsForRange } from '../services/sessions.js';
+import { addToTrash, captureLedgerEntry } from '../services/trash.js';
 
 // 財務資料屬敏感資訊，整個模組僅管理者可存取
 export const financeRouter = Router({ mergeParams: true });
@@ -86,6 +87,15 @@ financeRouter.put('/ledger/:id', (req, res) => {
 });
 
 financeRouter.delete('/ledger/:id', (req, res) => {
+  const existing = db.prepare('SELECT * FROM ledger_entries WHERE id = ? AND school_id = ?').get(req.params.id, req.params.schoolId);
+  if (!existing) return res.status(204).end();
+
+  const label = `${existing.entry_date} ${existing.entry_type === 'income' ? '收入' : '支出'} ${existing.amount}${existing.note ? ` ${existing.note}` : ''}`;
+  addToTrash(req.params.schoolId, 'ledger_entry', label, captureLedgerEntry(req.params.id), req.user.id, {
+    studentIds: existing.related_student_id ? [existing.related_student_id] : [],
+    teacherId: existing.related_teacher_id || null,
+  });
+
   db.prepare('DELETE FROM ledger_entries WHERE id = ? AND school_id = ?').run(req.params.id, req.params.schoolId);
   broadcastChange(req.params.schoolId, 'finance');
   res.status(204).end();
@@ -104,7 +114,7 @@ financeRouter.get('/ledger/:id/detail', (req, res) => {
   if (entry.category === 'salary' && entry.related_payslip_id) {
     const items = db
       .prepare(
-        `SELECT pi.id as session_id, pi.session_id as class_session_id, pi.hours, pi.rate, pi.pay, cs.session_date, cs.subject, cs.type,
+        `SELECT pi.id as session_id, pi.session_id as class_session_id, pi.hours, pi.rate, pi.pay, cs.session_date, cs.subject, cs.type, cs.start_slot, cs.duration_slots,
                 origin.session_date as origin_session_date, origin.start_slot as origin_start_slot
          FROM payslip_items pi JOIN class_sessions cs ON cs.id = pi.session_id
          LEFT JOIN class_sessions origin ON origin.id = cs.origin_session_id
@@ -125,7 +135,7 @@ financeRouter.get('/ledger/:id/detail', (req, res) => {
   if (entry.category === 'tuition' && entry.related_invoice_id) {
     const items = db
       .prepare(
-        `SELECT ii.id as session_id, cs.session_date, cs.subject, cs.type, ii.unit_price,
+        `SELECT ii.id as session_id, cs.session_date, cs.subject, cs.type, cs.start_slot, cs.duration_slots, ii.unit_price,
                 origin.session_date as origin_session_date, origin.start_slot as origin_start_slot
          FROM invoice_items ii JOIN class_sessions cs ON cs.id = ii.session_id
          LEFT JOIN class_sessions origin ON origin.id = cs.origin_session_id
@@ -183,7 +193,7 @@ financeRouter.post('/generate-salary', (req, res) => {
   const created = [];
   const updated = [];
   for (const payslip of payslips) {
-    const note = `${month} 薪資 - ${payslip.teacher_name}（薪資條 ${payslip.issued_date}）`;
+    const note = `${month} 薪資 - ${payslip.teacher_name}`;
     const existing = db
       .prepare(`SELECT id FROM ledger_entries WHERE school_id = ? AND category = 'salary' AND related_payslip_id = ?`)
       .get(req.params.schoolId, payslip.id);
@@ -225,7 +235,7 @@ financeRouter.post('/generate-tuition', (req, res) => {
   const updated = [];
   for (const invoice of invoices) {
     if (!invoice.total_amount) continue;
-    const note = `${month} 學費 - ${invoice.student_name}（繳費單 ${invoice.issued_date}）`;
+    const note = `${month} 學費 - ${invoice.student_name}`;
     const existing = db
       .prepare(`SELECT id FROM ledger_entries WHERE school_id = ? AND category = 'tuition' AND related_invoice_id = ?`)
       .get(req.params.schoolId, invoice.id);

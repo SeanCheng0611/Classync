@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { nanoid, customAlphabet } from 'nanoid';
 import { db } from '../db/index.js';
 import { requireAuth, requireMembership } from '../auth/middleware.js';
+import { addToTrash, captureInviteCode } from '../services/trash.js';
 
 const genCode = customAlphabet('23456789ABCDEFGHJKLMNPQRSTUVWXYZ', 8);
 
@@ -55,6 +56,11 @@ inviteCodesRouter.delete('/:id', (req, res) => {
     .get(req.params.id, req.params.schoolId);
   if (!code) return res.status(404).json({ error: 'not found' });
   if (code.used_at) return res.status(400).json({ error: '此邀請碼已被使用，無法撤銷' });
+
+  const roleLabel = { admin: '管理者', teacher: '教師', front_desk: '櫃台' }[code.role] || code.role;
+  addToTrash(req.params.schoolId, 'invite_code', `邀請碼 ${code.code}（${roleLabel}）`, captureInviteCode(req.params.id), req.user.id, {
+    teacherId: code.teacher_id || null,
+  });
 
   db.prepare('DELETE FROM invite_codes WHERE id = ?').run(req.params.id);
   res.status(204).end();

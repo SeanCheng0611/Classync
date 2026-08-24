@@ -51,10 +51,12 @@ export function calcSessionPay(teacher, session) {
   const students = sessionStudents(session.id);
   const hours = session.duration_slots / 2;
   const rateColumn = sessionRateColumn(students);
-  const rate = teacher[rateColumn];
+  const rate = session.rate_override ?? teacher[rateColumn];
   const pay = hours * rate;
   const fullyOnLeave = students.length > 0 && students.every((s) => s.attendance_status === 'leave');
   const leaveIsMakeup = fullyOnLeave && students.some((s) => s.makeup_arranged);
+  // 尚未點名：這堂課有學生，但至少一位還沒有出缺勤紀錄（attendance_status 為空）；開薪資條前應該先點名確認課堂確實發生過
+  const notYetMarked = students.length > 0 && students.some((s) => !s.attendance_status);
   const origin =
     session.type === 'makeup' && session.origin_session_id
       ? db.prepare('SELECT session_date, start_slot FROM class_sessions WHERE id = ?').get(session.origin_session_id)
@@ -67,12 +69,14 @@ export function calcSessionPay(teacher, session) {
     is_admin: students.length === 0,
     student_names: students.map((s) => s.name),
     start_slot: session.start_slot,
+    duration_slots: session.duration_slots,
     hours,
     rate_type: rateColumn,
     rate,
     pay,
     fully_on_leave: fullyOnLeave,
     leave_is_makeup: leaveIsMakeup,
+    not_yet_marked: notYetMarked,
     origin_session_date: origin?.session_date || null,
     origin_start_slot: origin?.start_slot ?? null,
   };
@@ -113,7 +117,7 @@ export function calcStudentTuition(schoolId, studentId, startDate, endDateExclus
 
   const items = db
     .prepare(
-      `SELECT cs.id as session_id, cs.session_date, cs.subject, ss.unit_price
+      `SELECT cs.id as session_id, cs.session_date, cs.subject, cs.type, cs.start_slot, cs.duration_slots, ss.unit_price
        FROM session_students ss
        JOIN class_sessions cs ON cs.id = ss.session_id
        JOIN attendance_records ar ON ar.session_id = cs.id AND ar.person_type = 'student' AND ar.person_id = ss.student_id

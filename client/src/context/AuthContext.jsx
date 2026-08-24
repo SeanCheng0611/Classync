@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState, useCallback } from 'react';
 import { api } from '../api';
-import { subscribeForceReload } from '../socket';
+import { subscribeForceReload, subscribeSchool } from '../socket';
 
 const AuthContext = createContext(null);
 
@@ -11,6 +11,8 @@ export function AuthProvider({ children }) {
     () => localStorage.getItem('currentSchoolId') || null
   );
   const [loading, setLoading] = useState(true);
+  // 「設定」子系統的值（一對多人數上限、時間選單優先範圍等），供全站共用（例如 TimeInput 的下拉排序）
+  const [schoolSettings, setSchoolSettings] = useState(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -44,6 +46,27 @@ export function AuthProvider({ children }) {
     return subscribeForceReload(currentSchoolId, user.id, () => window.location.reload());
   }, [user, currentSchoolId]);
 
+  const loadSchoolSettings = useCallback(async () => {
+    if (!currentSchoolId) return;
+    try {
+      const school = await api.get(`/api/schools/${currentSchoolId}`);
+      setSchoolSettings(school);
+    } catch {
+      setSchoolSettings(null);
+    }
+  }, [currentSchoolId]);
+
+  useEffect(() => {
+    loadSchoolSettings();
+  }, [loadSchoolSettings]);
+
+  useEffect(() => {
+    if (!currentSchoolId) return;
+    return subscribeSchool(currentSchoolId, (resource) => {
+      if (resource === 'scheduling-settings') loadSchoolSettings();
+    });
+  }, [currentSchoolId, loadSchoolSettings]);
+
   const logout = async () => {
     await api.post('/auth/logout');
     setUser(null);
@@ -61,6 +84,7 @@ export function AuthProvider({ children }) {
         loading,
         currentSchoolId,
         currentMembership,
+        schoolSettings,
         setCurrentSchoolId,
         refresh,
         logout,

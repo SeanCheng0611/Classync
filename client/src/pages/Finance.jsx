@@ -1,14 +1,17 @@
 import { Fragment, useEffect, useState, useCallback } from 'react';
+import { Link } from 'react-router-dom';
+import ExcelJS from 'exceljs';
 import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
 import { subscribeSchool } from '../socket';
-import { slotToTime } from '../lib/time';
+import { slotToTime, slotRangeLabel, todayStr } from '../lib/time';
+import { saveWorkbookAs, applyExportStyle } from '../lib/excelExport';
 
 const CATEGORY_LABEL = { tuition: '學費', salary: '薪資', manual: '其他' };
 const TYPE_LABEL = { regular: '固定', makeup: '調課', extra: '加課' };
 
 function currentMonth() {
-  return new Date().toISOString().slice(0, 7);
+  return todayStr().slice(0, 7);
 }
 
 function monthRangeStr(month) {
@@ -37,6 +40,7 @@ export default function Finance() {
   const [editDate, setEditDate] = useState('');
   const [editNote, setEditNote] = useState('');
   const [busy, setBusy] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [error, setError] = useState('');
 
   const [start, end] = monthRangeStr(month);
@@ -153,11 +157,51 @@ export default function Finance() {
     setDetailFor(entry.id);
   };
 
+  // 匯出當月收支明細
+  const exportExcel = async () => {
+    setError('');
+    setExporting(true);
+    try {
+      const workbook = new ExcelJS.Workbook();
+      const sheet = workbook.addWorksheet('收支明細');
+      sheet.columns = [
+        { header: '日期', key: 'date', width: 12 },
+        { header: '類型', key: 'type', width: 8 },
+        { header: '分類', key: 'category', width: 10 },
+        { header: '金額', key: 'amount', width: 12 },
+        { header: '備註', key: 'note', width: 30 },
+      ];
+      for (const e of entries) {
+        sheet.addRow({
+          date: e.entry_date,
+          type: e.entry_type === 'income' ? '收入' : '支出',
+          category: CATEGORY_LABEL[e.category],
+          amount: e.amount,
+          note: e.note,
+        });
+      }
+      applyExportStyle(sheet);
+      await saveWorkbookAs(workbook, `收支明細 ${month}.xlsx`);
+    } catch (err) {
+      setError('匯出失敗：' + err.message);
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <h2>收支統計</h2>
-        <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} />
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} />
+          {isAdmin && (
+            <button disabled={exporting} onClick={exportExcel}>
+              {exporting ? '匯出中...' : '匯出 Excel'}
+            </button>
+          )}
+          {isAdmin && <Link to="/finance/trash"><button type="button">回收桶</button></Link>}
+        </div>
       </div>
 
       {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
@@ -271,6 +315,7 @@ export default function Finance() {
                         {e.category === 'salary' ? (
                           <tr>
                             <th style={{ textAlign: 'left' }}>日期</th>
+                            <th style={{ textAlign: 'left' }}>時段</th>
                             <th style={{ textAlign: 'left' }}>科目</th>
                             <th style={{ textAlign: 'left' }}>類型</th>
                             <th style={{ textAlign: 'left' }}>備註</th>
@@ -282,6 +327,7 @@ export default function Finance() {
                         ) : (
                           <tr>
                             <th style={{ textAlign: 'left' }}>日期</th>
+                            <th style={{ textAlign: 'left' }}>時段</th>
                             <th style={{ textAlign: 'left' }}>科目</th>
                             <th style={{ textAlign: 'left' }}>類型</th>
                             <th style={{ textAlign: 'left' }}>備註</th>
@@ -294,7 +340,8 @@ export default function Finance() {
                           e.category === 'salary' ? (
                             <tr key={i.session_id}>
                               <td>{i.session_date}</td>
-                              <td>{i.subject}{i.is_admin && '（行政）'}</td>
+                              <td>{i.start_slot != null ? slotRangeLabel(i.start_slot, i.duration_slots) : '-'}</td>
+                              <td>{i.subject}</td>
                               <td>{TYPE_LABEL[i.type] || '-'}</td>
                               <td>
                                 {i.type === 'makeup' && i.origin_session_date && (
@@ -311,6 +358,7 @@ export default function Finance() {
                           ) : (
                             <tr key={i.session_id}>
                               <td>{i.session_date || '-'}</td>
+                              <td>{i.start_slot != null ? slotRangeLabel(i.start_slot, i.duration_slots) : '-'}</td>
                               <td>{i.subject}</td>
                               <td>{i.type ? TYPE_LABEL[i.type] : '-'}</td>
                               <td>
@@ -325,7 +373,7 @@ export default function Finance() {
                           )
                         )}
                         {detailItems.length === 0 && (
-                          <tr><td colSpan={e.category === 'salary' ? 8 : 5} style={{ color: 'var(--text-muted)', padding: 8 }}>無逐堂明細（可能依估算金額產生）</td></tr>
+                          <tr><td colSpan={e.category === 'salary' ? 9 : 6} style={{ color: 'var(--text-muted)', padding: 8 }}>無逐堂明細（可能依估算金額產生）</td></tr>
                         )}
                       </tbody>
                     </table>

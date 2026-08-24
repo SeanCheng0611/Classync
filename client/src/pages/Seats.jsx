@@ -6,9 +6,8 @@ import { subscribeSchool } from '../socket';
 import { todayStr, timeToSlot, slotRangeLabel } from '../lib/time';
 import TimeInput from '../components/TimeInput';
 
-const SEAT_NUMBERS = Array.from({ length: 13 }, (_, i) => i + 1);
-// 依實際教室座位排列分排顯示：第一排1-4、第二排5-8、第三排9-11、第四排12-13
-const SEAT_ROWS = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11], [12, 13]];
+// 座位版面預設值（新補習班或還沒載入時使用），實際版面存在 school.seat_layout，可透過拖曳調整、新增座位
+const DEFAULT_SEAT_LAYOUT = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11], [12, 13]];
 
 const DOUBLE_BLOCKS = [
   { key: 'b1', label: '時段1', start: '18:00', end: '19:30' },
@@ -47,9 +46,15 @@ export default function Seats() {
   const [sessions, setSessions] = useState([]);
   const [teachers, setTeachers] = useState([]);
   const [seatsByBlock, setSeatsByBlock] = useState({});
+  const [seatLayout, setSeatLayout] = useState(DEFAULT_SEAT_LAYOUT);
+  const [draggedSeat, setDraggedSeat] = useState(null);
+  const [draggedSession, setDraggedSession] = useState(null);
+  const [deleteSeatMode, setDeleteSeatMode] = useState(false);
   const [error, setError] = useState('');
   const [exporting, setExporting] = useState(false);
   const [blockOverrides, setBlockOverrides] = useState({}); // { [sessionId]: blockKey }，手動覆蓋「上課資訊」判斷的時段
+
+  const seatNumbers = seatLayout.flat();
 
   const blocks =
     mode === 'single'
@@ -58,12 +63,19 @@ export default function Seats() {
 
   const load = useCallback(async () => {
     if (!currentSchoolId) return;
-    const [s, te] = await Promise.all([
+    const [s, te, sch] = await Promise.all([
       api.get(`/api/schools/${currentSchoolId}/sessions?date=${date}`),
       api.get(`/api/schools/${currentSchoolId}/teachers`),
+      api.get(`/api/schools/${currentSchoolId}`),
     ]);
     setSessions(s);
     setTeachers(te);
+    try {
+      const layout = JSON.parse(sch.seat_layout);
+      if (Array.isArray(layout) && layout.length > 0) setSeatLayout(layout);
+    } catch {
+      // 版面資料異常時維持目前畫面上的版面，不覆蓋成預設值
+    }
   }, [currentSchoolId, date]);
 
   const loadSeats = useCallback(async () => {
@@ -89,7 +101,7 @@ export default function Seats() {
   useEffect(() => {
     if (!currentSchoolId) return;
     return subscribeSchool(currentSchoolId, (resource) => {
-      if (['sessions', 'schedule', 'teachers', 'students'].includes(resource)) load();
+      if (['sessions', 'schedule', 'teachers', 'students', 'seat-layout'].includes(resource)) load();
       if (resource === 'seats') loadSeats();
     });
   }, [currentSchoolId, load, loadSeats]);
@@ -138,6 +150,148 @@ export default function Seats() {
     }
   };
 
+  // 新增座位：由使用者輸入要新增的桌號；接在最後一排後面，該排未滿 4 個就補進去，滿了就另開新的一排
+  const addSeat = async () => {
+    setError('');
+    const input = prompt('請輸入要新增的桌號：');
+    if (input === null) return;
+    const seatNumber = Number(input.trim());
+    if (!Number.isInteger(seatNumber) || seatNumber < 1) {
+      setError('桌號必須是正整數');
+      return;
+    }
+    if (seatNumbers.includes(seatNumber)) {
+      setError(`${seatNumber} 號桌已經存在`);
+      return;
+    }
+    const newLayout = seatLayout.map((row) => row.slice());
+    const lastRow = newLayout[newLayout.length - 1];
+    if (lastRow && lastRow.length < 4) {
+      lastRow.push(seatNumber);
+    } else {
+      newLayout.push([seatNumber]);
+    }
+    try {
+      await api.put(`/api/schools/${currentSchoolId}/seat-layout`, { layout: newLayout });
+      setSeatLayout(newLayout);
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  // 拖曳調整座位順序：交換兩個座位編號在版面中的位置（不影響已排的課堂資料，只是換顯示位置）
+  const swapSeats = async (seatA, seatB) => {
+    if (seatA === seatB) return;
+    const newLayout = seatLayout.map((row) => row.map((n) => (n === seatA ? seatB : n === seatB ? seatA : n)));
+    setSeatLayout(newLayout);
+    try {
+      await api.put(`/api/schools/${currentSchoolId}/seat-layout`, { layout: newLayout });
+    } catch (err) {
+      setError(err.message);
+      load();
+    }
+  };
+
+  // 刪除座位：直接從版面上移除該桌號，不影響已產生的課堂/出缺勤紀錄
+  const deleteSeat = async (seatNumber) => {
+    if (!confirm(`確定要刪除 ${seatNumber} 號桌嗎？`)) return;
+    setError('');
+    const newLayout = seatLayout.map((row) => row.filter((n) => n !== seatNumber)).filter((row) => row.length > 0);
+    setSeatLayout(newLayout);
+    try {
+      await api.put(`/api/schools/${currentSchoolId}/seat-layout`, { layout: newLayout });
+    } catch (err) {
+      setError(err.message);
+      load();
+    }
+  };
+
+  // 自動排座位：把「上課資訊」裡還沒排入的課堂（人數 2 人以下者）依序塞進空桌；
+  // 雙時段模式下，同一位教師若在兩個時段都有課，會盡量安排在同一張桌（已排過的時段優先沿用該桌號）
+  const autoAssignSeats = async () => {
+    setError('');
+    const seatableSessions = daySessions.filter((s) => s.students.length <= 2);
+    if (seatableSessions.length === 0) return;
+
+    const takenByBlock = {};
+    const teacherSeatByBlock = {};
+    for (const b of blocks) {
+      const blockSeats = seatsByBlock[b.key] || [];
+      takenByBlock[b.key] = new Set(blockSeats.map((s) => s.seat_number));
+      teacherSeatByBlock[b.key] = {};
+      for (const s of blockSeats) {
+        if (s.teacher_id) teacherSeatByBlock[b.key][s.teacher_id] = s.seat_number;
+      }
+    }
+
+    const byTeacher = new Map();
+    for (const session of seatableSessions) {
+      const list = byTeacher.get(session.teacher_id) || [];
+      list.push(session);
+      byTeacher.set(session.teacher_id, list);
+    }
+
+    const assignments = [];
+    let failedCount = 0;
+
+    for (const [teacherId, sessionsForTeacher] of byTeacher) {
+      let preferred = null;
+      for (const b of blocks) {
+        if (teacherSeatByBlock[b.key][teacherId]) {
+          preferred = teacherSeatByBlock[b.key][teacherId];
+          break;
+        }
+      }
+      if (!preferred) {
+        const neededBlocks = sessionsForTeacher.map((s) => resolvedBlock(s));
+        preferred = seatNumbers.find((n) => neededBlocks.every((b) => !takenByBlock[b.key].has(n))) || null;
+      }
+      for (const session of sessionsForTeacher) {
+        const block = resolvedBlock(session);
+        let seatNumber = preferred && !takenByBlock[block.key].has(preferred) ? preferred : null;
+        if (!seatNumber) seatNumber = seatNumbers.find((n) => !takenByBlock[block.key].has(n)) || null;
+        if (!seatNumber) {
+          failedCount += 1;
+          continue;
+        }
+        takenByBlock[block.key].add(seatNumber);
+        teacherSeatByBlock[block.key][teacherId] = seatNumber;
+        assignments.push({ session, seatNumber, block });
+      }
+    }
+
+    try {
+      for (const { session, seatNumber, block } of assignments) {
+        await api.put(`/api/schools/${currentSchoolId}/seats/${seatNumber}`, {
+          date,
+          time_slot: timeToSlot(block.start),
+          teacher_id: session.teacher_id,
+          student_ids: session.students.slice(0, 2).map((s) => s.id),
+        });
+      }
+      loadSeats();
+      if (failedCount > 0) setError(`已自動排入 ${assignments.length} 堂課，桌位不足，${failedCount} 堂課請手動安排`);
+    } catch (err) {
+      setError(err.message);
+      loadSeats();
+    }
+  };
+
+  // 拖曳到某一排的空位：把座位從原本的位置移出，接到目標排的最後面（該排最多 4 個，畫面上空位只會出現在未滿的排尾）
+  const moveSeatToRow = async (seatNumber, targetRowIdx) => {
+    const newLayout = seatLayout.map((row) => row.filter((n) => n !== seatNumber));
+    if (newLayout[targetRowIdx].length >= 4) return;
+    newLayout[targetRowIdx].push(seatNumber);
+    const cleaned = newLayout.filter((row) => row.length > 0);
+    setSeatLayout(cleaned);
+    try {
+      await api.put(`/api/schools/${currentSchoolId}/seat-layout`, { layout: cleaned });
+    } catch (err) {
+      setError(err.message);
+      load();
+    }
+  };
+
   // 匯出座位表：不論目前是單/雙時段模式，一律同時抓時段1(18:00)、時段2(19:30)的座位資料，
   // 匯出座位表：簡單列表，欄位為桌號、教師、學生、時段
   const exportSeatChart = async () => {
@@ -163,7 +317,7 @@ export default function Seats() {
         cell.border = EXPORT_BORDER;
       });
 
-      for (const n of SEAT_NUMBERS) {
+      for (const n of seatNumbers) {
         for (const { key, label } of DOUBLE_BLOCKS) {
           const seat = seatsByKey[key].find((s) => s.seat_number === n);
           if (!seat || (!seat.teacher_id && seat.students.length === 0)) continue;
@@ -215,28 +369,28 @@ export default function Seats() {
     }
   };
 
-  // 上課資訊：列出當日全部有學生的課堂，依教師姓名、時間排序
+  // 上課資訊：列出當日全部有學生、且「尚未排好座位」的課堂，依教師姓名、時間排序；已經排好座位的課堂改到下方「已排座位清單」顯示，這裡就不重複列了
   const daySessions = sessions
     .filter((s) => s.students.length > 0)
+    .filter((s) => {
+      const block = resolvedBlock(s);
+      const blockSeats = seatsByBlock[block.key] || [];
+      return !blockSeats.some((seat) => seat.teacher_id === s.teacher_id && sameStudents(seat, s));
+    })
     .slice()
     .sort((a, b) => teacherName(a.teacher_id).localeCompare(teacherName(b.teacher_id)) || a.start_slot - b.start_slot);
 
-  // 已排座位清單：把目前每個時段桌號上已確定的學生攤平列出，方便一眼確認誰已經排好座位
-  const seatedList = blocks
-    .flatMap((b) =>
-      (seatsByBlock[b.key] || [])
-        .filter((s) => s.students.length > 0)
-        .flatMap((s) =>
-          s.students.map((stu) => ({
-            key: `${b.key}-${s.seat_number}-${stu.id}`,
-            blockLabel: b.label,
-            seatNumber: s.seat_number,
-            studentName: stu.name,
-            teacherName: teacherName(s.teacher_id),
-          }))
-        )
-    )
-    .sort((a, b) => a.seatNumber - b.seatNumber);
+  // 已排座位清單：跟「上課資訊」相反，只列出已經排好座位的課堂，欄位跟「上課資訊」一致方便對照
+  const seatedSessions = sessions
+    .filter((s) => s.students.length > 0)
+    .map((s) => {
+      const block = resolvedBlock(s);
+      const blockSeats = seatsByBlock[block.key] || [];
+      const assigned = blockSeats.find((seat) => seat.teacher_id === s.teacher_id && sameStudents(seat, s));
+      return { session: s, block, assigned };
+    })
+    .filter((x) => x.assigned)
+    .sort((a, b) => a.assigned.seat_number - b.assigned.seat_number);
 
   return (
     <div>
@@ -248,6 +402,13 @@ export default function Seats() {
             <option value="single">單時段</option>
             <option value="double">雙時段</option>
           </select>
+          {isAdmin && <button onClick={autoAssignSeats}>自動排座位</button>}
+          {isAdmin && <button onClick={addSeat}>+ 新增座位</button>}
+          {isAdmin && (
+            <button onClick={() => setDeleteSeatMode((v) => !v)}>
+              {deleteSeatMode ? '結束刪除模式' : '- 刪除座位'}
+            </button>
+          )}
           {isAdmin && (
             <button disabled={exporting} onClick={exportSeatChart}>
               {exporting ? '匯出中...' : '匯出座位表'}
@@ -289,8 +450,19 @@ export default function Seats() {
                 const occupiedByOtherTeacher = new Set(
                   blockSeats.filter((s) => s.teacher_id && s.teacher_id !== session.teacher_id).map((s) => s.seat_number)
                 );
+                const draggableRow = isAdmin && !tooManyStudents;
                 return (
-                  <tr key={session.id} style={{ borderBottom: '1px solid var(--border)' }}>
+                  <tr
+                    key={session.id}
+                    draggable={draggableRow}
+                    onDragStart={() => draggableRow && setDraggedSession(session)}
+                    onDragEnd={() => setDraggedSession(null)}
+                    style={{
+                      borderBottom: '1px solid var(--border)',
+                      cursor: draggableRow ? 'grab' : 'default',
+                      opacity: draggedSession?.id === session.id ? 0.5 : 1,
+                    }}
+                  >
                     <td>{slotRangeLabel(session.start_slot, session.duration_slots)}</td>
                     <td>{teacherName(session.teacher_id)}</td>
                     <td>{session.subject}</td>
@@ -320,7 +492,7 @@ export default function Seats() {
                           onChange={(e) => assignSeat(session, e.target.value ? Number(e.target.value) : null)}
                         >
                           <option value="">未安排</option>
-                          {SEAT_NUMBERS.filter((n) => n === assigned?.seat_number || !occupiedByOtherTeacher.has(n)).map((n) => (
+                          {seatNumbers.filter((n) => n === assigned?.seat_number || !occupiedByOtherTeacher.has(n)).map((n) => (
                             <option key={n} value={n}>{n}</option>
                           ))}
                         </select>
@@ -338,48 +510,137 @@ export default function Seats() {
           </table>
 
           <h3 style={{ margin: '16px 0 6px' }}>已排座位清單</h3>
-          <ul style={{ listStyle: 'none', padding: 0, margin: 0, fontSize: 13 }}>
-            {seatedList.map((item) => (
-              <li key={item.key} style={{ padding: '4px 0', borderBottom: '1px solid var(--border)' }}>
-                {item.seatNumber} 號桌{mode === 'double' && item.blockLabel ? `（${item.blockLabel}）` : ''} - {item.studentName}
-                <span style={{ color: 'var(--text-muted)' }}>（{item.teacherName || '未安排教師'}）</span>
-              </li>
-            ))}
-            {seatedList.length === 0 && (
-              <li style={{ color: 'var(--text-muted)', padding: '4px 0' }}>尚無已排座位的學生</li>
-            )}
-          </ul>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+            <thead>
+              <tr style={{ textAlign: 'left', borderBottom: '2px solid var(--border-strong)' }}>
+                <th>時間</th>
+                <th>教師</th>
+                <th>科目</th>
+                <th>學生</th>
+                {mode === 'double' && <th>時段</th>}
+                <th>桌號</th>
+              </tr>
+            </thead>
+            <tbody>
+              {seatedSessions.map(({ session, block, assigned }) => (
+                <tr key={session.id} style={{ borderBottom: '1px solid var(--border)' }}>
+                  <td>{slotRangeLabel(session.start_slot, session.duration_slots)}</td>
+                  <td>{teacherName(session.teacher_id)}</td>
+                  <td>{session.subject}</td>
+                  <td>{session.students.map((s) => s.name).join(', ')}</td>
+                  {mode === 'double' && <td>{block.label}</td>}
+                  <td>{assigned.seat_number}</td>
+                </tr>
+              ))}
+              {seatedSessions.length === 0 && (
+                <tr><td colSpan={mode === 'double' ? 6 : 5} style={{ color: 'var(--text-muted)', padding: 12 }}>尚無已排座位的學生</td></tr>
+              )}
+            </tbody>
+          </table>
         </div>
 
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {SEAT_ROWS.map((row, rowIdx) => (
-            <div key={rowIdx} style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }}>
-              {row.map((n) => (
-                <div key={n} data-seat={n} className="card" style={{ padding: 10 }}>
-                  <strong>{n} 號桌</strong>
-                  {blocks.map((b) => {
-                    const seat = (seatsByBlock[b.key] || []).find((s) => s.seat_number === n);
-                    const hasAssignment = seat && (seat.teacher_id || seat.students.length > 0);
-                    return (
-                      <div key={b.key} style={{ marginTop: 6, fontSize: 13 }}>
-                        {b.label && <div style={{ color: 'var(--text-muted)' }}>{b.label}</div>}
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 4 }}>
-                          <span>
-                            {hasAssignment
-                              ? `${teacherName(seat.teacher_id) || '未安排教師'} - ${seat.students.map((s) => s.name).join(', ') || '未安排學生'}`
-                              : '未安排'}
-                          </span>
-                          {isAdmin && hasAssignment && (
-                            <button style={{ fontSize: 11 }} onClick={() => clearBlockSeat(n, b)}>清空</button>
-                          )}
-                        </div>
+          {seatLayout.map((row, rowIdx) => {
+            const slots = [...row, ...Array(Math.max(0, 4 - row.length)).fill(null)];
+            return (
+              <div key={rowIdx} style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }}>
+                {slots.map((n, slotIdx) =>
+                  n == null ? (
+                    <div
+                      key={`empty-${rowIdx}-${slotIdx}`}
+                      style={{
+                        minHeight: 150,
+                        borderRadius: 'var(--radius)',
+                        border: isAdmin ? '1px dashed var(--border-strong)' : 'none',
+                      }}
+                      onDragOver={(e) => isAdmin && e.preventDefault()}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        if (draggedSeat != null) moveSeatToRow(draggedSeat, rowIdx);
+                        setDraggedSeat(null);
+                      }}
+                    />
+                  ) : (
+                    <div
+                      key={n}
+                      data-seat={n}
+                      className="card"
+                      style={{
+                        padding: 10,
+                        minHeight: 150,
+                        cursor: isAdmin ? 'grab' : 'default',
+                        opacity: draggedSeat === n ? 0.5 : 1,
+                      }}
+                      draggable={isAdmin}
+                      onDragStart={() => setDraggedSeat(n)}
+                      onDragEnd={() => setDraggedSeat(null)}
+                      onDragOver={(e) => isAdmin && e.preventDefault()}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        if (draggedSession) {
+                          assignSeat(draggedSession, n);
+                          setDraggedSession(null);
+                        } else if (draggedSeat != null) {
+                          swapSeats(draggedSeat, n);
+                        }
+                        setDraggedSeat(null);
+                      }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <strong>{n} 號桌</strong>
+                        {isAdmin && deleteSeatMode && (
+                          <button
+                            type="button"
+                            title="刪除座位"
+                            onClick={() => deleteSeat(n)}
+                            style={{
+                              width: 22,
+                              height: 18,
+                              padding: 0,
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              background: 'var(--accent-soft)',
+                              borderColor: 'var(--accent-soft)',
+                              borderRadius: 4,
+                            }}
+                          >
+                            <span style={{ width: 10, height: 2, borderRadius: 1, background: 'var(--accent-hover)' }} />
+                          </button>
+                        )}
                       </div>
-                    );
-                  })}
-                </div>
-              ))}
-            </div>
-          ))}
+                      {blocks.map((b) => {
+                        const seat = (seatsByBlock[b.key] || []).find((s) => s.seat_number === n);
+                        const hasAssignment = seat && (seat.teacher_id || seat.students.length > 0);
+                        return (
+                          <div key={b.key} style={{ marginTop: 6, fontSize: 13 }}>
+                            {b.label && <div style={{ color: 'var(--text-muted)' }}>{b.label}</div>}
+                            {hasAssignment ? (
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 4 }}>
+                                <div>
+                                  <div style={{ fontWeight: 600 }}>{teacherName(seat.teacher_id) || '未安排教師'}</div>
+                                  <div style={{ color: 'var(--text-muted)' }}>
+                                    {seat.students.map((s) => s.name).join('、') || '未安排學生'}
+                                  </div>
+                                </div>
+                                {isAdmin && (
+                                  <button style={{ fontSize: 11 }} onClick={() => clearBlockSeat(n, b)}>
+                                    清空
+                                  </button>
+                                )}
+                              </div>
+                            ) : (
+                              <div style={{ color: 'var(--text-muted)' }}>未安排</div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>
