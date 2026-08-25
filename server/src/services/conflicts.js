@@ -54,15 +54,20 @@ export function findTeacherSessionConflict(schoolId, teacherId, date, startSlot,
   return rows.find((r) => overlaps(startSlot, durationSlots, r.start_slot, r.duration_slots)) || null;
 }
 
-// 檢查某學生在指定日期是否已有課堂時段重疊（含固定課展開、調課、加課），排除自己正在編輯的那堂
+// 檢查某學生在指定日期是否已有課堂時段重疊（含固定課展開、調課、加課），排除自己正在編輯的那堂；
+// 該學生已請假的課堂不算佔用時段（請假＝該時段對這位學生來說是空的，可以另外安排課程）
 export function findStudentSessionConflict(schoolId, studentId, date, startSlot, durationSlots, excludeSessionId) {
   ensureSessionsForDate(schoolId, date);
   const rows = db
     .prepare(
       `SELECT cs.* FROM class_sessions cs JOIN session_students ss ON ss.session_id = cs.id
-       WHERE cs.school_id = ? AND ss.student_id = ? AND cs.session_date = ? AND cs.cancelled = 0 AND cs.id != ?`
+       WHERE cs.school_id = ? AND ss.student_id = ? AND cs.session_date = ? AND cs.cancelled = 0 AND cs.id != ?
+       AND NOT EXISTS (
+         SELECT 1 FROM attendance_records ar
+         WHERE ar.session_id = cs.id AND ar.person_type = 'student' AND ar.person_id = ? AND ar.status = 'leave'
+       )`
     )
-    .all(schoolId, studentId, date, excludeSessionId || '');
+    .all(schoolId, studentId, date, excludeSessionId || '', studentId);
   return rows.find((r) => overlaps(startSlot, durationSlots, r.start_slot, r.duration_slots)) || null;
 }
 

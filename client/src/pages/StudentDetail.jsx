@@ -110,7 +110,7 @@ export default function StudentDetail() {
   });
 
   const [rescheduleRow, setRescheduleRow] = useState(null); // session_id 正在調課中
-  const [rescheduleForm, setRescheduleForm] = useState({ new_date: todayStr(), new_start_time: '', new_end_time: '' });
+  const [rescheduleForm, setRescheduleForm] = useState({ new_date: todayStr(), new_start_time: '', new_end_time: '', teacher_id: '' });
 
   const [historyMonth, setHistoryMonth] = useState(currentMonth());
   const [fixedMonth, setFixedMonth] = useState(currentMonth());
@@ -399,6 +399,7 @@ export default function StudentDetail() {
       new_date: h.session_date,
       new_start_time: slotToTime(h.start_slot),
       new_end_time: slotToTime(h.start_slot + h.duration_slots),
+      teacher_id: h.teacher_id,
     });
   };
 
@@ -407,6 +408,10 @@ export default function StudentDetail() {
     const hours = durationHoursBetween(rescheduleForm.new_start_time, rescheduleForm.new_end_time);
     if (!hours) {
       setError('結束時間需晚於開始時間');
+      return;
+    }
+    if (!rescheduleForm.teacher_id) {
+      setError('請選擇教師');
       return;
     }
     try {
@@ -420,7 +425,7 @@ export default function StudentDetail() {
       await api.post(`/api/schools/${currentSchoolId}/sessions`, {
         type: 'makeup',
         origin_session_id: h.session_id,
-        teacher_id: h.teacher_id,
+        teacher_id: rescheduleForm.teacher_id,
         subject: h.subject,
         session_date: rescheduleForm.new_date,
         start_slot: timeToSlot(rescheduleForm.new_start_time),
@@ -759,7 +764,14 @@ export default function StudentDetail() {
               {isAdmin && (
                 <td>
                   {rescheduleRow === h.session_id ? (
-                    <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                    <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' }}>
+                      <div style={{ width: 130 }}>
+                        <SearchSelect
+                          options={teachers}
+                          value={rescheduleForm.teacher_id}
+                          onChange={(v) => setRescheduleForm({ ...rescheduleForm, teacher_id: v })}
+                        />
+                      </div>
                       <input
                         type="date"
                         style={{ width: 130 }}

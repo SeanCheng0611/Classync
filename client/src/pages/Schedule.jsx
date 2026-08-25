@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
@@ -62,9 +62,17 @@ export default function Schedule() {
 
   const [showAddClass, setShowAddClass] = useState(false);
   const [addClassForm, setAddClassForm] = useState(emptyAddClassForm);
+  const addClassFormRef = useRef(null);
+
+  const cancelAddClass = () => {
+    setShowAddClass(false);
+    setAddClassForm(emptyAddClassForm());
+    setError('');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
 
   const [rescheduleKey, setRescheduleKey] = useState(null);
-  const [rescheduleForm, setRescheduleForm] = useState({ new_date: todayStr(), new_start_time: '', new_end_time: '' });
+  const [rescheduleForm, setRescheduleForm] = useState({ new_date: todayStr(), new_start_time: '', new_end_time: '', teacher_id: '' });
   const [expandedSessions, setExpandedSessions] = useState(new Set());
 
   const toggleExpanded = (sessionId) => {
@@ -184,6 +192,7 @@ export default function Schedule() {
       new_date: session.session_date,
       new_start_time: slotToTime(session.start_slot),
       new_end_time: slotToTime(session.start_slot + session.duration_slots),
+      teacher_id: session.teacher_id,
     });
   };
 
@@ -192,6 +201,10 @@ export default function Schedule() {
     const hours = durationHoursBetween(rescheduleForm.new_start_time, rescheduleForm.new_end_time);
     if (!hours) {
       setError('結束時間需晚於開始時間');
+      return;
+    }
+    if (!rescheduleForm.teacher_id) {
+      setError('請選擇教師');
       return;
     }
     try {
@@ -206,7 +219,7 @@ export default function Schedule() {
       await api.post(`/api/schools/${currentSchoolId}/sessions`, {
         type: 'makeup',
         origin_session_id: session.id,
-        teacher_id: session.teacher_id,
+        teacher_id: rescheduleForm.teacher_id,
         subject: session.subject,
         session_date: rescheduleForm.new_date,
         start_slot: timeToSlot(rescheduleForm.new_start_time),
@@ -266,17 +279,17 @@ export default function Schedule() {
           {isAdmin && (
             <button
               onClick={() => {
-                setShowAddClass((v) => {
-                  const next = !v;
-                  if (next) {
-                    setAddClassForm((f) => ({
-                      ...f,
-                      start_time: f.start_time || schoolSettings?.time_picker_range_start || '',
-                      end_time: f.end_time || schoolSettings?.time_picker_range_end || '',
-                    }));
-                  }
-                  return next;
-                });
+                if (showAddClass) {
+                  cancelAddClass();
+                  return;
+                }
+                setAddClassForm((f) => ({
+                  ...f,
+                  start_time: f.start_time || schoolSettings?.time_picker_range_start || '',
+                  end_time: f.end_time || schoolSettings?.time_picker_range_end || '',
+                }));
+                setShowAddClass(true);
+                requestAnimationFrame(() => addClassFormRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
               }}
             >
               {showAddClass ? '取消加課' : '+ 加課'}
@@ -353,6 +366,11 @@ export default function Schedule() {
                         <div key={s.id} style={{ marginTop: 4 }}>
                           {rescheduleKey === recordKey(session.id, s.id) ? (
                             <div style={{ display: 'grid', gap: 4 }}>
+                              <SearchSelect
+                                options={teachers}
+                                value={rescheduleForm.teacher_id}
+                                onChange={(v) => setRescheduleForm({ ...rescheduleForm, teacher_id: v })}
+                              />
                               <input
                                 type="date"
                                 value={rescheduleForm.new_date}
@@ -405,7 +423,7 @@ export default function Schedule() {
       </div>
 
       {showAddClass && (
-        <form onSubmit={submitAddClass} style={{ marginTop: 24, maxWidth: 360, display: 'grid', gap: 8 }}>
+        <form ref={addClassFormRef} onSubmit={submitAddClass} style={{ marginTop: 24, maxWidth: 360, display: 'grid', gap: 8 }}>
           <h3>加課</h3>
           {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
           <GroupStudentSelect
@@ -449,7 +467,10 @@ export default function Schedule() {
           <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 13 }}>
             總時長：{durationHoursBetween(addClassForm.start_time, addClassForm.end_time) || 0} 小時
           </p>
-          <div><button type="submit">送出</button></div>
+          <div>
+            <button type="submit">送出</button>{' '}
+            <button type="button" onClick={cancelAddClass}>取消</button>
+          </div>
         </form>
       )}
 
