@@ -448,7 +448,7 @@ export default function TeacherDetail() {
 
   return (
     <div style={{ maxWidth: 1100, margin: '0 auto' }}>
-      <button onClick={() => navigate('/teachers')}>← 返回教師列表</button>
+      <button onClick={() => navigate(-1)}>← 返回</button>
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12 }}>
         <h2 style={{ margin: 0 }}>{teacher.name}</h2>

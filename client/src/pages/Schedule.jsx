@@ -569,15 +569,15 @@ export default function Schedule() {
                               <div style={{ fontSize: 12 }}>
                                 <Link to={`/students/${s.id}`}>{s.name}</Link>
                               </div>
-                              <div style={{ display: 'flex', gap: 6, marginTop: 4, flexWrap: 'wrap' }}>
+                              <div style={{ display: 'flex', gap: 6, marginTop: 4, flexWrap: 'nowrap' }}>
                                 {onLeave ? (
-                                  <button style={{ fontSize: 13, padding: '5px 12px' }} onClick={() => undoStudent(session, s.id)}>
+                                  <button style={{ fontSize: 13, padding: '5px 8px', flex: 1, whiteSpace: 'nowrap' }} onClick={() => undoStudent(session, s.id)}>
                                     {record.makeup_arranged ? '取消調課' : '取消請假'}
                                   </button>
                                 ) : (
                                   <>
-                                    <button style={{ fontSize: 13, padding: '5px 12px' }} onClick={() => leaveStudent(session, s.id)}>請假</button>
-                                    <button style={{ fontSize: 13, padding: '5px 12px' }} onClick={() => startReschedule(session, s.id)}>調課</button>
+                                    <button style={{ fontSize: 13, padding: '5px 8px', flex: 1, whiteSpace: 'nowrap' }} onClick={() => leaveStudent(session, s.id)}>請假</button>
+                                    <button style={{ fontSize: 13, padding: '5px 8px', flex: 1, whiteSpace: 'nowrap' }} onClick={() => startReschedule(session, s.id)}>調課</button>
                                   </>
                                 )}
                               </div>
