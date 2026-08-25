@@ -79,7 +79,7 @@ export default function Schedule() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const [rescheduleKey, setRescheduleKey] = useState(null);
+  const [rescheduleTarget, setRescheduleTarget] = useState(null); // { session, personId }：目前正在調課的課堂與學生，供畫面最外層的浮窗使用
   const [rescheduleForm, setRescheduleForm] = useState({ new_date: todayStr(), new_start_time: '', new_end_time: '', teacher_id: '' });
   const [expandedSessions, setExpandedSessions] = useState(new Set());
   const [expandedNames, setExpandedNames] = useState(new Set());
@@ -244,13 +244,25 @@ export default function Schedule() {
 
   const startReschedule = (session, personId) => {
     setError('');
-    setRescheduleKey(recordKey(session.id, personId));
+    setRescheduleTarget({ session, personId });
     setRescheduleForm({
       new_date: session.session_date,
       new_start_time: slotToTime(session.start_slot),
       new_end_time: slotToTime(session.start_slot + session.duration_slots),
       teacher_id: session.teacher_id,
     });
+  };
+
+  const cancelReschedule = async () => {
+    const target = rescheduleTarget;
+    setRescheduleTarget(null);
+    // 保險：若因故卡在「已標記請假/調課但尚未成功建立新課堂」的狀態，取消時一併復原
+    if (target) {
+      const record = records[recordKey(target.session.id, target.personId)];
+      if (record?.status === 'leave' && !record.makeup_session_id) {
+        await undoStudent(target.session, target.personId);
+      }
+    }
   };
 
   const confirmReschedule = async (session, personId) => {
@@ -285,7 +297,7 @@ export default function Schedule() {
         duration_slots: hoursToDurationSlots(hours),
         students: [{ student_id: personId, unit_price: student?.unit_price || 0 }],
       });
-      setRescheduleKey(null);
+      setRescheduleTarget(null);
       load();
     } catch (err) {
       // 新課堂建立失敗（例如時段重疊）時，把剛剛標記的請假/調課復原，避免卡在錯誤的「已調課」狀態
@@ -522,86 +534,22 @@ export default function Schedule() {
                       const record = records[recordKey(session.id, s.id)];
                       const onLeave = record?.status === 'leave';
                       return (
-                        <div key={s.id} style={{ marginTop: 4, position: 'relative' }}>
-                          {rescheduleKey === recordKey(session.id, s.id) ? (
-                            <div
-                              style={{
-                                position: 'absolute',
-                                top: 0,
-                                left: 0,
-                                right: 0,
-                                zIndex: 30,
-                                background: 'var(--surface)',
-                                border: '1px solid var(--border-strong)',
-                                borderRadius: 6,
-                                boxShadow: 'var(--shadow)',
-                                padding: 8,
-                                boxSizing: 'border-box',
-                                display: 'grid',
-                                gap: 8,
-                              }}
-                            >
-                              <SearchSelect
-                                options={teachers}
-                                value={rescheduleForm.teacher_id}
-                                onChange={(v) => setRescheduleForm({ ...rescheduleForm, teacher_id: v })}
-                              />
-                              <input
-                                type="date"
-                                style={{ width: '100%' }}
-                                value={rescheduleForm.new_date}
-                                onChange={(e) => setRescheduleForm({ ...rescheduleForm, new_date: e.target.value })}
-                              />
-                              <TimeInput
-                                style={{ width: '100%' }}
-                                value={rescheduleForm.new_start_time}
-                                onChange={(v) =>
-                                  setRescheduleForm({
-                                    ...rescheduleForm,
-                                    new_start_time: v,
-                                    new_end_time: addHoursToTime(v, schoolSettings?.default_class_duration_hours || 1.5),
-                                  })
-                                }
-                              />
-                              <TimeInput
-                                style={{ width: '100%' }}
-                                value={rescheduleForm.new_end_time}
-                                onChange={(v) => setRescheduleForm({ ...rescheduleForm, new_end_time: v })}
-                              />
-                              <div>
-                                <button onClick={() => confirmReschedule(session, s.id)}>確認</button>{' '}
-                                <button
-                                  onClick={async () => {
-                                    setRescheduleKey(null);
-                                    // 保險：若因故卡在「已標記請假/調課但尚未成功建立新課堂」的狀態，取消時一併復原
-                                    if (record?.status === 'leave' && !record.makeup_session_id) {
-                                      await undoStudent(session, s.id);
-                                    }
-                                  }}
-                                >
-                                  取消
-                                </button>
-                              </div>
-                            </div>
-                          ) : (
-                            <>
-                              <div style={{ fontSize: 12 }}>
-                                <Link to={`/students/${s.id}`}>{s.name}</Link>
-                              </div>
-                              <div style={{ display: 'flex', gap: 6, marginTop: 4, flexWrap: 'nowrap' }}>
-                                {onLeave ? (
-                                  <button style={{ fontSize: 13, padding: '5px 8px', flex: 1, whiteSpace: 'nowrap' }} onClick={() => undoStudent(session, s.id)}>
-                                    {record.makeup_arranged ? '取消調課' : '取消請假'}
-                                  </button>
-                                ) : (
-                                  <>
-                                    <button style={{ fontSize: 13, padding: '5px 8px', flex: 1, whiteSpace: 'nowrap' }} onClick={() => leaveStudent(session, s.id)}>請假</button>
-                                    <button style={{ fontSize: 13, padding: '5px 8px', flex: 1, whiteSpace: 'nowrap' }} onClick={() => startReschedule(session, s.id)}>調課</button>
-                                  </>
-                                )}
-                              </div>
-                            </>
-                          )}
+                        <div key={s.id} style={{ marginTop: 4 }}>
+                          <div style={{ fontSize: 12 }}>
+                            <Link to={`/students/${s.id}`}>{s.name}</Link>
+                          </div>
+                          <div style={{ display: 'flex', gap: 6, marginTop: 4, flexWrap: 'nowrap' }}>
+                            {onLeave ? (
+                              <button style={{ fontSize: 13, padding: '5px 8px', flex: 1, whiteSpace: 'nowrap' }} onClick={() => undoStudent(session, s.id)}>
+                                {record.makeup_arranged ? '取消調課' : '取消請假'}
+                              </button>
+                            ) : (
+                              <>
+                                <button style={{ fontSize: 13, padding: '5px 8px', flex: 1, whiteSpace: 'nowrap' }} onClick={() => leaveStudent(session, s.id)}>請假</button>
+                                <button style={{ fontSize: 13, padding: '5px 8px', flex: 1, whiteSpace: 'nowrap' }} onClick={() => startReschedule(session, s.id)}>調課</button>
+                              </>
+                            )}
+                          </div>
                         </div>
                       );
                     })}
@@ -611,6 +559,73 @@ export default function Schedule() {
           </div>
         ))}
       </div>
+
+      {rescheduleTarget && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 100,
+            background: 'rgba(0, 0, 0, 0.35)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 16,
+          }}
+          onClick={cancelReschedule}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: 'var(--surface)',
+              border: '1px solid var(--border-strong)',
+              borderRadius: 8,
+              boxShadow: 'var(--shadow)',
+              padding: 16,
+              width: 280,
+              maxWidth: '100%',
+              display: 'grid',
+              gap: 8,
+            }}
+          >
+            <h3 style={{ margin: 0 }}>調課 - {rescheduleTarget.session.students.find((s) => s.id === rescheduleTarget.personId)?.name}</h3>
+            <SearchSelect
+              options={teachers}
+              value={rescheduleForm.teacher_id}
+              onChange={(v) => setRescheduleForm({ ...rescheduleForm, teacher_id: v })}
+            />
+            <input
+              type="date"
+              style={{ width: '100%', boxSizing: 'border-box' }}
+              value={rescheduleForm.new_date}
+              onChange={(e) => setRescheduleForm({ ...rescheduleForm, new_date: e.target.value })}
+            />
+            <TimeInput
+              style={{ width: '100%' }}
+              inputStyle={{ width: '100%', boxSizing: 'border-box' }}
+              value={rescheduleForm.new_start_time}
+              onChange={(v) =>
+                setRescheduleForm({
+                  ...rescheduleForm,
+                  new_start_time: v,
+                  new_end_time: addHoursToTime(v, schoolSettings?.default_class_duration_hours || 1.5),
+                })
+              }
+            />
+            <TimeInput
+              style={{ width: '100%' }}
+              inputStyle={{ width: '100%', boxSizing: 'border-box' }}
+              value={rescheduleForm.new_end_time}
+              onChange={(v) => setRescheduleForm({ ...rescheduleForm, new_end_time: v })}
+            />
+            {error && <p style={{ color: 'var(--danger)', margin: 0 }}>{error}</p>}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={() => confirmReschedule(rescheduleTarget.session, rescheduleTarget.personId)}>確認</button>
+              <button onClick={cancelReschedule}>取消</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showAddClass && (
         <form ref={addClassFormRef} onSubmit={submitAddClass} style={{ marginTop: 24, maxWidth: 360, display: 'grid', gap: 8 }}>
