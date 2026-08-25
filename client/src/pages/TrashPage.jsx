@@ -93,7 +93,7 @@ export default function TrashPage({ title, entityTypes, scope }) {
   };
 
   return (
-    <div>
+    <div style={{ maxWidth: 1100, margin: '0 auto' }}>
       <button onClick={() => navigate(-1)}>← 返回</button>
 
       <h2 style={{ marginTop: 12 }}>{title}</h2>

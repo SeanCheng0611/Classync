@@ -173,6 +173,60 @@ schoolsRouter.put('/:schoolId/type-colors', (req, res) => {
   res.json({ ...db.prepare('SELECT * FROM schools WHERE id = ?').get(req.params.schoolId), role: membership.role });
 });
 
+const SCHEDULE_TYPE_ORDER_KEYS = ['regular', 'extra', 'makeup'];
+
+// 課表子系統：同一時段內固定課/加課/調課的排列順序，僅管理者可調整；已請假的課堂仍照原本類型排序，不會被排到最後
+schoolsRouter.put('/:schoolId/schedule-type-order', (req, res) => {
+  const membership = getMembership(req.user.id, req.params.schoolId);
+  if (!membership || membership.role !== 'admin') return res.status(403).json({ error: 'admin only' });
+
+  const school = db.prepare('SELECT * FROM schools WHERE id = ?').get(req.params.schoolId);
+  if (!school) return res.status(404).json({ error: 'not found' });
+
+  const { schedule_type_order } = req.body;
+  const valid =
+    Array.isArray(schedule_type_order) &&
+    schedule_type_order.length === SCHEDULE_TYPE_ORDER_KEYS.length &&
+    SCHEDULE_TYPE_ORDER_KEYS.every((k) => schedule_type_order.includes(k));
+  if (!valid) {
+    return res.status(400).json({ error: 'schedule_type_order 需包含 regular/extra/makeup 各一次' });
+  }
+
+  db.prepare('UPDATE schools SET schedule_type_order = ? WHERE id = ?').run(
+    JSON.stringify(schedule_type_order),
+    req.params.schoolId
+  );
+
+  broadcastChange(req.params.schoolId, 'scheduling-settings');
+  res.json({ ...db.prepare('SELECT * FROM schools WHERE id = ?').get(req.params.schoolId), role: membership.role });
+});
+
+// 點名子系統：同一時段內固定課/加課/調課的排列順序，邏輯與 schedule-type-order 相同但獨立設定，僅管理者可調整
+schoolsRouter.put('/:schoolId/attendance-type-order', (req, res) => {
+  const membership = getMembership(req.user.id, req.params.schoolId);
+  if (!membership || membership.role !== 'admin') return res.status(403).json({ error: 'admin only' });
+
+  const school = db.prepare('SELECT * FROM schools WHERE id = ?').get(req.params.schoolId);
+  if (!school) return res.status(404).json({ error: 'not found' });
+
+  const { attendance_type_order } = req.body;
+  const valid =
+    Array.isArray(attendance_type_order) &&
+    attendance_type_order.length === SCHEDULE_TYPE_ORDER_KEYS.length &&
+    SCHEDULE_TYPE_ORDER_KEYS.every((k) => attendance_type_order.includes(k));
+  if (!valid) {
+    return res.status(400).json({ error: 'attendance_type_order 需包含 regular/extra/makeup 各一次' });
+  }
+
+  db.prepare('UPDATE schools SET attendance_type_order = ? WHERE id = ?').run(
+    JSON.stringify(attendance_type_order),
+    req.params.schoolId
+  );
+
+  broadcastChange(req.params.schoolId, 'scheduling-settings');
+  res.json({ ...db.prepare('SELECT * FROM schools WHERE id = ?').get(req.params.schoolId), role: membership.role });
+});
+
 // 座位系統版面（座位排列位置）：admin/front_desk 皆可調整，layout 是二維陣列，每個內層陣列（一橫排）最多 4 個座位編號
 schoolsRouter.put('/:schoolId/seat-layout', (req, res) => {
   const membership = getMembership(req.user.id, req.params.schoolId);

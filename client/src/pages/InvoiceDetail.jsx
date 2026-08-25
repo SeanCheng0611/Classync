@@ -161,7 +161,7 @@ export default function InvoiceDetail() {
   const stagedTotal = staged.reduce((sum, i) => sum + i.unit_price, 0);
 
   return (
-    <div>
+    <div style={{ maxWidth: 1100, margin: '0 auto' }}>
       <button onClick={() => navigate('/invoices')}>← 返回學生列表</button>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12 }}>
         <h2 style={{ margin: 0 }}>{student.name} - 繳費單開立</h2>

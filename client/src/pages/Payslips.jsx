@@ -29,7 +29,7 @@ export default function Payslips() {
   if (!isAdmin) return <p>僅管理者可使用薪資系統</p>;
 
   return (
-    <div>
+    <div style={{ maxWidth: 1100, margin: '0 auto' }}>
       <h2>薪資系統</h2>
 
       <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 12 }}>

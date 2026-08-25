@@ -440,7 +440,7 @@ export default function StudentDetail() {
   };
 
   return (
-    <div>
+    <div style={{ maxWidth: 1100, margin: '0 auto' }}>
       <button onClick={() => navigate('/students')}>← 返回學生列表</button>
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12 }}>

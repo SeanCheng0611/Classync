@@ -163,7 +163,7 @@ export default function PayslipDetail() {
   const stagedTotal = staged.reduce((sum, i) => sum + i.pay, 0);
 
   return (
-    <div>
+    <div style={{ maxWidth: 1100, margin: '0 auto' }}>
       <button onClick={() => navigate('/payslips')}>← 返回教師列表</button>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12 }}>
         <h2 style={{ margin: 0 }}>{teacher.name} - 薪資條開立</h2>

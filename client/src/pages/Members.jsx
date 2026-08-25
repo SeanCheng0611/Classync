@@ -111,7 +111,7 @@ export default function Members() {
   };
 
   return (
-    <div>
+    <div style={{ maxWidth: 1100, margin: '0 auto' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <h2 style={{ margin: 0 }}>成員管理</h2>
         <Link to="/members/trash"><button type="button">回收桶</button></Link>

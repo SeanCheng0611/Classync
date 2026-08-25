@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS schools (
   subjects TEXT NOT NULL DEFAULT '["C","E","M","N","S","PHY","CHEM","HIST","GEO","CIV","AD","J"]',
   -- 課表／點名子系統的課堂類型標籤顏色（固定課/加課/調課 各對應一個莫蘭迪色票代號），JSON 物件，可在「設定」子系統調整
   type_colors TEXT NOT NULL DEFAULT '{"regular":"camel","extra":"green","makeup":"blue","leave":"red"}',
+  -- 課表同一時段內，固定課/加課/調課的排列順序（JSON 字串陣列，由前到後），可在「設定」子系統調整；已請假的課堂仍照原本類型排序，不再另外排到最後
+  schedule_type_order TEXT NOT NULL DEFAULT '["extra","makeup","regular"]',
+  -- 點名子系統同一時段內，固定課/加課/調課的排列順序，邏輯與 schedule_type_order 相同，但獨立設定
+  attendance_type_order TEXT NOT NULL DEFAULT '["extra","makeup","regular"]',
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

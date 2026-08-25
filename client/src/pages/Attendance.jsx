@@ -5,7 +5,7 @@ import { useAuth } from '../context/AuthContext';
 import { subscribeSchool } from '../socket';
 import { slotRangeLabel, todayStr, timeToSlot, slotToTime, durationHoursBetween, hoursToDurationSlots, addHoursToTime } from '../lib/time';
 import TimeInput from '../components/TimeInput';
-import { sessionTypeLabel, sessionTypeColor, leaveColor } from '../lib/sessionType';
+import { sessionTypeLabel, sessionTypeColor, leaveColor, parseAttendanceTypeOrder, sessionTypeOrderRank } from '../lib/sessionType';
 
 const EXPORT_FONT = { name: '辰宇落雁體 2.0 Thin', size: 16 };
 const EXPORT_BORDER = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
@@ -276,24 +276,19 @@ export default function Attendance() {
     }
   };
 
-  // 排序：時間 > 固定課 > 調課 > 加課 > 請假（該生已請假/已調課的排最後，不論原本課堂類型）
-  const rowRank = (session, resolved) => {
-    if (resolved) return 3;
-    if (session.type === 'regular') return 0;
-    if (session.type === 'makeup') return 1;
-    return 2;
-  };
+  // 排序：開始時間 > 結束時間（越早結束排越前面）> 固定課/加課/調課 的順序（見「設定」子系統的「點名排列順序」，邏輯與課表排列順序相同；已請假/已調課仍照原本類型排序，不會被排到最後）
+  const attendanceTypeOrder = parseAttendanceTypeOrder(schoolSettings);
   const sortedRows = sessions
     .flatMap((session) => session.students.map((student) => ({ session, student })))
-    .sort((a, b) => {
-      if (a.session.start_slot !== b.session.start_slot) return a.session.start_slot - b.session.start_slot;
-      const resolvedA = records[recordKey(a.session.id, a.student.id)]?.status === 'leave';
-      const resolvedB = records[recordKey(b.session.id, b.student.id)]?.status === 'leave';
-      return rowRank(a.session, resolvedA) - rowRank(b.session, resolvedB);
-    });
+    .sort(
+      (a, b) =>
+        a.session.start_slot - b.session.start_slot ||
+        (a.session.start_slot + a.session.duration_slots) - (b.session.start_slot + b.session.duration_slots) ||
+        sessionTypeOrderRank(a.session, attendanceTypeOrder) - sessionTypeOrderRank(b.session, attendanceTypeOrder)
+    );
 
   return (
-    <div>
+    <div style={{ maxWidth: 1100, margin: '0 auto' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <h2>點名系統</h2>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>

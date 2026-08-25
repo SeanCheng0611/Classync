@@ -48,3 +48,32 @@ export function sessionTypeColor(session, schoolSettings) {
 export function leaveColor(schoolSettings) {
   return swatchColor(parseTypeColors(schoolSettings), 'leave');
 }
+
+// 課表／點名同一時段內，固定課/加課/調課的排列順序，可在「設定」子系統分別調整；已請假的課堂仍照原本類型排序，不會被排到最後
+export const DEFAULT_TYPE_ORDER = ['extra', 'makeup', 'regular'];
+
+function parseTypeOrderField(schoolSettings, field) {
+  try {
+    const parsed = JSON.parse(schoolSettings?.[field] || '[]');
+    if (Array.isArray(parsed) && parsed.length === 3 && DEFAULT_TYPE_ORDER.every((k) => parsed.includes(k))) {
+      return parsed;
+    }
+  } catch {
+    // 解析失敗就用預設順序
+  }
+  return DEFAULT_TYPE_ORDER;
+}
+
+export function parseTypeOrder(schoolSettings) {
+  return parseTypeOrderField(schoolSettings, 'schedule_type_order');
+}
+
+export function parseAttendanceTypeOrder(schoolSettings) {
+  return parseTypeOrderField(schoolSettings, 'attendance_type_order');
+}
+
+export function sessionTypeOrderRank(session, typeOrder) {
+  const key = session.type === 'regular' || session.type === 'makeup' ? session.type : 'extra';
+  const idx = typeOrder.indexOf(key);
+  return idx === -1 ? typeOrder.length : idx;
+}

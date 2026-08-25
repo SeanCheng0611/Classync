@@ -190,7 +190,7 @@ export default function Finance() {
   };
 
   return (
-    <div>
+    <div style={{ maxWidth: 1100, margin: '0 auto' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <h2>收支統計</h2>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>

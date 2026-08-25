@@ -399,7 +399,7 @@ export default function Teachers() {
   };
 
   return (
-    <div>
+    <div style={{ maxWidth: 1100, margin: '0 auto' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <h2>教師檔案</h2>
         <div style={{ display: 'flex', gap: 8 }}>

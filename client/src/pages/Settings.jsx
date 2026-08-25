@@ -4,7 +4,54 @@ import { useAuth } from '../context/AuthContext';
 import { subscribeSchool } from '../socket';
 import TimeInput from '../components/TimeInput';
 import { DEFAULT_SUBJECTS, parseSubjects } from '../lib/subjects';
-import { SWATCHES, TAG_TYPES, DEFAULT_TYPE_COLORS, parseTypeColors } from '../lib/sessionType';
+import { SWATCHES, TAG_TYPES, DEFAULT_TYPE_COLORS, parseTypeColors, DEFAULT_TYPE_ORDER, parseTypeOrder, parseAttendanceTypeOrder } from '../lib/sessionType';
+
+const TYPE_ORDER_LABELS = Object.fromEntries(TAG_TYPES.map(({ key, label }) => [key, label]));
+
+// 固定課/加課/調課排列順序的拖曳排序清單，課表排列順序／點名排列順序共用同一套邏輯
+function TypeOrderEditor({ value, onChange }) {
+  const [dragIndex, setDragIndex] = useState(null);
+
+  const reorder = (fromIndex, toIndex) => {
+    if (fromIndex === toIndex || fromIndex == null || toIndex == null) return;
+    const next = value.slice();
+    const [moved] = next.splice(fromIndex, 1);
+    next.splice(toIndex, 0, moved);
+    onChange(next);
+  };
+
+  return (
+    <>
+      {value.map((key, i) => (
+        <div
+          key={key}
+          draggable
+          onDragStart={() => setDragIndex(i)}
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => {
+            e.preventDefault();
+            reorder(dragIndex, i);
+            setDragIndex(null);
+          }}
+          onDragEnd={() => setDragIndex(null)}
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            padding: '4px 8px',
+            border: '1px solid var(--border-strong)',
+            borderRadius: 4,
+            cursor: 'grab',
+            background: dragIndex === i ? 'var(--surface-muted)' : undefined,
+          }}
+        >
+          <span>{i + 1}. {TYPE_ORDER_LABELS[key]}</span>
+          <span style={{ color: 'var(--text-muted)' }}>⠿</span>
+        </div>
+      ))}
+    </>
+  );
+}
 
 function SettingsSection({ title, open, onToggle, onSubmit, children }) {
   return (
@@ -47,6 +94,12 @@ export default function Settings() {
   const [openTypeColors, setOpenTypeColors] = useState(false);
   const [typeColorsForm, setTypeColorsForm] = useState(DEFAULT_TYPE_COLORS);
 
+  const [openTypeOrder, setOpenTypeOrder] = useState(false);
+  const [typeOrderForm, setTypeOrderForm] = useState(DEFAULT_TYPE_ORDER);
+
+  const [openAttendanceOrder, setOpenAttendanceOrder] = useState(false);
+  const [attendanceOrderForm, setAttendanceOrderForm] = useState(DEFAULT_TYPE_ORDER);
+
   const load = useCallback(async () => {
     if (!currentSchoolId) return;
     try {
@@ -65,6 +118,8 @@ export default function Settings() {
       });
       setSpanForm({ default_schedule_span_months: sch.default_schedule_span_months });
       setTypeColorsForm(parseTypeColors(sch));
+      setTypeOrderForm(parseTypeOrder(sch));
+      setAttendanceOrderForm(parseAttendanceTypeOrder(sch));
     } catch (err) {
       setError(err.message);
     }
@@ -176,8 +231,30 @@ export default function Settings() {
     }
   };
 
+  const saveTypeOrder = async (e) => {
+    e.preventDefault();
+    setError('');
+    try {
+      await api.put(`/api/schools/${currentSchoolId}/schedule-type-order`, { schedule_type_order: typeOrderForm });
+      setOpenTypeOrder(false);
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  const saveAttendanceOrder = async (e) => {
+    e.preventDefault();
+    setError('');
+    try {
+      await api.put(`/api/schools/${currentSchoolId}/attendance-type-order`, { attendance_type_order: attendanceOrderForm });
+      setOpenAttendanceOrder(false);
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
   return (
-    <div>
+    <div style={{ maxWidth: 1100, margin: '0 auto' }}>
       <h2>設定</h2>
       {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
 
@@ -262,6 +339,14 @@ export default function Settings() {
             </div>
           </div>
         ))}
+      </SettingsSection>
+
+      <SettingsSection title="課表排列順序" open={openTypeOrder} onToggle={() => setOpenTypeOrder((v) => !v)} onSubmit={saveTypeOrder}>
+        <TypeOrderEditor value={typeOrderForm} onChange={setTypeOrderForm} />
+      </SettingsSection>
+
+      <SettingsSection title="點名排列順序" open={openAttendanceOrder} onToggle={() => setOpenAttendanceOrder((v) => !v)} onSubmit={saveAttendanceOrder}>
+        <TypeOrderEditor value={attendanceOrderForm} onChange={setAttendanceOrderForm} />
       </SettingsSection>
 
       <h3 style={{ marginBottom: 4, color: 'var(--text-muted)', fontSize: 14, fontWeight: 600, letterSpacing: 1 }}>收費與科目</h3>

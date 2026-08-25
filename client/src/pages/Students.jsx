@@ -378,7 +378,7 @@ export default function Students() {
   };
 
   return (
-    <div>
+    <div style={{ maxWidth: 1100, margin: '0 auto' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <h2>學生檔案</h2>
         <div style={{ display: 'flex', gap: 8 }}>

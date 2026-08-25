@@ -29,7 +29,7 @@ export default function Invoices() {
   if (!isAdmin) return <p>僅管理者可使用繳費單系統</p>;
 
   return (
-    <div>
+    <div style={{ maxWidth: 1100, margin: '0 auto' }}>
       <h2>繳費單系統</h2>
 
       <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: 12 }}>
