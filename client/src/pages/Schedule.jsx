@@ -522,9 +522,25 @@ export default function Schedule() {
                       const record = records[recordKey(session.id, s.id)];
                       const onLeave = record?.status === 'leave';
                       return (
-                        <div key={s.id} style={{ marginTop: 4 }}>
+                        <div key={s.id} style={{ marginTop: 4, position: 'relative' }}>
                           {rescheduleKey === recordKey(session.id, s.id) ? (
-                            <div style={{ display: 'grid', gap: 8 }}>
+                            <div
+                              style={{
+                                position: 'absolute',
+                                top: 0,
+                                left: 0,
+                                zIndex: 30,
+                                width: 220,
+                                maxWidth: '90vw',
+                                background: 'var(--surface)',
+                                border: '1px solid var(--border-strong)',
+                                borderRadius: 6,
+                                boxShadow: 'var(--shadow)',
+                                padding: 8,
+                                display: 'grid',
+                                gap: 8,
+                              }}
+                            >
                               <SearchSelect
                                 options={teachers}
                                 value={rescheduleForm.teacher_id}
