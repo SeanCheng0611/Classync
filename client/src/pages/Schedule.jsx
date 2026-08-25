@@ -532,10 +532,12 @@ export default function Schedule() {
                               />
                               <input
                                 type="date"
+                                style={{ width: '100%' }}
                                 value={rescheduleForm.new_date}
                                 onChange={(e) => setRescheduleForm({ ...rescheduleForm, new_date: e.target.value })}
                               />
                               <TimeInput
+                                style={{ width: '100%' }}
                                 value={rescheduleForm.new_start_time}
                                 onChange={(v) =>
                                   setRescheduleForm({
@@ -546,6 +548,7 @@ export default function Schedule() {
                                 }
                               />
                               <TimeInput
+                                style={{ width: '100%' }}
                                 value={rescheduleForm.new_end_time}
                                 onChange={(v) => setRescheduleForm({ ...rescheduleForm, new_end_time: v })}
                               />

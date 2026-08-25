@@ -35,7 +35,7 @@ export default function TimeInput({ value, onChange, style, ...rest }) {
         value={value}
         onChange={(e) => onChange(formatTimeInput(e.target.value))}
         onFocus={() => setOpen(true)}
-        style={{ width: 90 }}
+        style={{ width: '100%' }}
         {...rest}
       />
       {open && (
@@ -44,6 +44,7 @@ export default function TimeInput({ value, onChange, style, ...rest }) {
             position: 'absolute',
             top: '100%',
             left: 0,
+            right: 0,
             zIndex: 20,
             marginTop: 2,
             maxHeight: 220,
@@ -54,7 +55,6 @@ export default function TimeInput({ value, onChange, style, ...rest }) {
             border: '1px solid var(--border-strong)',
             borderRadius: 6,
             boxShadow: 'var(--shadow)',
-            width: 90,
           }}
         >
           {DROPDOWN_TIME_OPTIONS.map((t) => (
