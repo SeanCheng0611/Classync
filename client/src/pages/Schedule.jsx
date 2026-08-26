@@ -8,10 +8,50 @@ import TimeInput from '../components/TimeInput';
 import SubjectSelect from '../components/SubjectSelect';
 import SearchSelect from '../components/SearchSelect';
 import GroupStudentSelect from '../components/GroupStudentSelect';
+import WeekdayCheckboxes from '../components/WeekdayCheckboxes';
 import { sessionTypeLabel, sessionTypeColor, leaveColor, parseTypeOrder, sessionTypeOrderRank } from '../lib/sessionType';
 
 function emptyAddClassForm() {
   return { teacher_id: '', subject: '', entries: [{ student_id: '', unit_price: 0 }], date: todayStr(), start_time: '', end_time: '' };
+}
+
+function emptyFixedForm() {
+  return {
+    teacher_id: '',
+    subject: '',
+    entries: [{ student_id: '', unit_price: 0 }],
+    weekdays: [1],
+    start_time: '',
+    end_time: '',
+    start_month: currentMonth(),
+    end_month: '',
+  };
+}
+
+function currentMonth() {
+  return todayStr().slice(0, 7);
+}
+
+function monthRangeStr(month) {
+  const [y, m] = month.split('-').map(Number);
+  const start = `${month}-01`;
+  const end = m === 12 ? `${y + 1}-01-01` : `${y}-${String(m + 1).padStart(2, '0')}-01`;
+  return [start, end];
+}
+
+function shiftMonth(month, delta) {
+  const [y, m] = month.split('-').map(Number);
+  const total = y * 12 + (m - 1) + delta;
+  const ny = Math.floor(total / 12);
+  const nm = (total % 12) + 1;
+  return `${ny}-${String(nm).padStart(2, '0')}`;
+}
+
+// 該月最後一天的日期字串；用 Date(year, month, 0) 純本地日期運算取得天數，避免 toISOString() 轉 UTC 導致日期偏移一天
+function monthLastDay(month) {
+  const [y, m] = month.split('-').map(Number);
+  const lastDay = new Date(y, m, 0).getDate();
+  return `${month}-${String(lastDay).padStart(2, '0')}`;
 }
 
 function recordKey(sessionId, personId) {
@@ -69,12 +109,16 @@ export default function Schedule() {
   }, [error]);
 
   const [showAddClass, setShowAddClass] = useState(false);
+  const [scheduleMode, setScheduleMode] = useState('single'); // 'single' | 'multiple'
   const [addClassForm, setAddClassForm] = useState(emptyAddClassForm);
+  const [fixedForm, setFixedForm] = useState(emptyFixedForm);
   const addClassFormRef = useRef(null);
 
   const cancelAddClass = () => {
     setShowAddClass(false);
+    setScheduleMode('single');
     setAddClassForm(emptyAddClassForm());
+    setFixedForm(emptyFixedForm());
     setError('');
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
@@ -219,7 +263,71 @@ export default function Schedule() {
       });
       setShowAddClass(false);
       setAddClassForm(emptyAddClassForm());
-      setNotice('加課成功');
+      setNotice('排課成功');
+      load();
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  const addFixedClass = async (e) => {
+    e.preventDefault();
+    setError('');
+    if (!fixedForm.subject.trim()) {
+      setError('請選擇科目');
+      return;
+    }
+    const chosenEntries = fixedForm.entries.filter((entry) => entry.student_id);
+    if (chosenEntries.length === 0) {
+      setError('請至少選擇一位學生');
+      return;
+    }
+    if (!fixedForm.teacher_id) {
+      setError('請選擇教師');
+      return;
+    }
+    const hours = durationHoursBetween(fixedForm.start_time, fixedForm.end_time);
+    if (!hours) {
+      setError('結束時間需晚於開始時間');
+      return;
+    }
+    if (fixedForm.weekdays.length === 0) {
+      setError('請至少選擇一個星期');
+      return;
+    }
+    if (!fixedForm.start_month) {
+      setError('請選擇起始月份');
+      return;
+    }
+    if (fixedForm.end_month && fixedForm.end_month < fixedForm.start_month) {
+      setError('結束月份不能早於起始月份');
+      return;
+    }
+    try {
+      const [startMonthFirstDay] = monthRangeStr(fixedForm.start_month);
+      // 起始月份若已經過去，實際生效日改為今天，避免補算過去未曾發生的課堂
+      const activeFrom = startMonthFirstDay < todayStr() ? todayStr() : startMonthFirstDay;
+      // 結束月份留空時，預設展開「設定」子系統設定的月數（含起始月份）
+      const spanMonths = schoolSettings?.default_schedule_span_months || 4;
+      const activeUntil = monthLastDay(fixedForm.end_month || shiftMonth(fixedForm.start_month, spanMonths - 1));
+      const students = chosenEntries.map((entry) => ({ student_id: entry.student_id, unit_price: Number(entry.unit_price) || 0 }));
+      await Promise.all(
+        fixedForm.weekdays.map((weekday) =>
+          api.post(`/api/schools/${currentSchoolId}/schedule-templates`, {
+            teacher_id: fixedForm.teacher_id,
+            subject: fixedForm.subject.trim(),
+            weekday,
+            start_slot: timeToSlot(fixedForm.start_time),
+            duration_slots: hoursToDurationSlots(hours),
+            students,
+            active_from: activeFrom,
+            active_until: activeUntil,
+          })
+        )
+      );
+      setShowAddClass(false);
+      setFixedForm(emptyFixedForm());
+      setNotice('固定排課新增成功');
       load();
     } catch (err) {
       setError(err.message);
@@ -369,16 +477,25 @@ export default function Schedule() {
                   cancelAddClass();
                   return;
                 }
+                const defaultStart = schoolSettings?.time_picker_range_start || '';
+                const defaultEnd = schoolSettings?.time_picker_range_end || '';
+                const spanMonths = schoolSettings?.default_schedule_span_months || 4;
                 setAddClassForm((f) => ({
                   ...f,
-                  start_time: f.start_time || schoolSettings?.time_picker_range_start || '',
-                  end_time: f.end_time || schoolSettings?.time_picker_range_end || '',
+                  start_time: f.start_time || defaultStart,
+                  end_time: f.end_time || defaultEnd,
+                }));
+                setFixedForm((f) => ({
+                  ...f,
+                  start_time: f.start_time || defaultStart,
+                  end_time: f.end_time || defaultEnd,
+                  end_month: f.end_month || shiftMonth(f.start_month, spanMonths - 1),
                 }));
                 setShowAddClass(true);
                 requestAnimationFrame(() => addClassFormRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
               }}
             >
-              {showAddClass ? '取消加課' : '+ 加課'}
+              {showAddClass ? '取消排課' : '+ 排課'}
             </button>
           )}
           {isAdmin && (
@@ -628,55 +745,139 @@ export default function Schedule() {
       )}
 
       {showAddClass && (
-        <form ref={addClassFormRef} onSubmit={submitAddClass} style={{ marginTop: 24, maxWidth: 360, display: 'grid', gap: 8 }}>
-          <h3>加課</h3>
+        <div ref={addClassFormRef} style={{ marginTop: 24, maxWidth: 360, display: 'grid', gap: 8 }}>
+          <h3 style={{ margin: 0 }}>排課</h3>
           {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
-          <GroupStudentSelect
-            students={students}
-            school={school}
-            maxGroupSize={school?.group_class_max_students || 2}
-            entries={addClassForm.entries}
-            onChange={(entries) => setAddClassForm({ ...addClassForm, entries })}
-          />
-          <label>
-            科目
-            <SubjectSelect value={addClassForm.subject} onChange={(v) => setAddClassForm({ ...addClassForm, subject: v })} />
-          </label>
-          <label>
-            教師
-            <SearchSelect options={teachers} value={addClassForm.teacher_id} onChange={(v) => setAddClassForm({ ...addClassForm, teacher_id: v })} />
-          </label>
-          <label>
-            日期
-            <input type="date" value={addClassForm.date} onChange={(e) => setAddClassForm({ ...addClassForm, date: e.target.value })} />
-          </label>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <label>
-              開始時間
-              <TimeInput
-                value={addClassForm.start_time}
-                onChange={(v) =>
-                  setAddClassForm({
-                    ...addClassForm,
-                    start_time: v,
-                    end_time: addHoursToTime(v, schoolSettings?.default_class_duration_hours || 1.5),
-                  })
-                }
+          <div style={{ display: 'flex', gap: 16 }}>
+            <label style={{ display: 'inline-flex', flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+              <input type="radio" name="scheduleMode" checked={scheduleMode === 'single'} onChange={() => setScheduleMode('single')} />
+              單堂
+            </label>
+            <label style={{ display: 'inline-flex', flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+              <input type="radio" name="scheduleMode" checked={scheduleMode === 'multiple'} onChange={() => setScheduleMode('multiple')} />
+              多堂
+            </label>
+          </div>
+
+          {scheduleMode === 'single' ? (
+            <form onSubmit={submitAddClass} style={{ display: 'grid', gap: 8 }}>
+              <GroupStudentSelect
+                students={students}
+                school={school}
+                maxGroupSize={school?.group_class_max_students || 2}
+                entries={addClassForm.entries}
+                onChange={(entries) => setAddClassForm({ ...addClassForm, entries })}
               />
-            </label>
-            <label>
-              結束時間
-              <TimeInput value={addClassForm.end_time} onChange={(v) => setAddClassForm({ ...addClassForm, end_time: v })} />
-            </label>
-          </div>
-          <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 13 }}>
-            總時長：{durationHoursBetween(addClassForm.start_time, addClassForm.end_time) || 0} 小時
-          </p>
-          <div>
-            <button type="submit">送出</button>{' '}
-            <button type="button" onClick={cancelAddClass}>取消</button>
-          </div>
-        </form>
+              <label>
+                科目
+                <SubjectSelect value={addClassForm.subject} onChange={(v) => setAddClassForm({ ...addClassForm, subject: v })} />
+              </label>
+              <label>
+                教師
+                <SearchSelect options={teachers} value={addClassForm.teacher_id} onChange={(v) => setAddClassForm({ ...addClassForm, teacher_id: v })} />
+              </label>
+              <label>
+                日期
+                <input type="date" value={addClassForm.date} onChange={(e) => setAddClassForm({ ...addClassForm, date: e.target.value })} />
+              </label>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <label>
+                  開始時間
+                  <TimeInput
+                    value={addClassForm.start_time}
+                    onChange={(v) =>
+                      setAddClassForm({
+                        ...addClassForm,
+                        start_time: v,
+                        end_time: addHoursToTime(v, schoolSettings?.default_class_duration_hours || 1.5),
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  結束時間
+                  <TimeInput value={addClassForm.end_time} onChange={(v) => setAddClassForm({ ...addClassForm, end_time: v })} />
+                </label>
+              </div>
+              <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 13 }}>
+                總時長：{durationHoursBetween(addClassForm.start_time, addClassForm.end_time) || 0} 小時
+              </p>
+              <div>
+                <button type="submit">送出</button>{' '}
+                <button type="button" onClick={cancelAddClass}>取消</button>
+              </div>
+            </form>
+          ) : (
+            <form onSubmit={addFixedClass} style={{ display: 'grid', gap: 8 }}>
+              <GroupStudentSelect
+                students={students}
+                school={school}
+                maxGroupSize={school?.group_class_max_students || 2}
+                entries={fixedForm.entries}
+                onChange={(entries) => setFixedForm({ ...fixedForm, entries })}
+              />
+              <label>
+                科目
+                <SubjectSelect value={fixedForm.subject} onChange={(v) => setFixedForm({ ...fixedForm, subject: v })} />
+              </label>
+              <label>
+                教師
+                <SearchSelect options={teachers} value={fixedForm.teacher_id} onChange={(v) => setFixedForm({ ...fixedForm, teacher_id: v })} />
+              </label>
+              <label>
+                星期（可複選）
+                <WeekdayCheckboxes value={fixedForm.weekdays} onChange={(v) => setFixedForm({ ...fixedForm, weekdays: v })} />
+              </label>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <label>
+                  開始時間
+                  <TimeInput
+                    value={fixedForm.start_time}
+                    onChange={(v) =>
+                      setFixedForm({
+                        ...fixedForm,
+                        start_time: v,
+                        end_time: addHoursToTime(v, schoolSettings?.default_class_duration_hours || 1.5),
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  結束時間
+                  <TimeInput value={fixedForm.end_time} onChange={(v) => setFixedForm({ ...fixedForm, end_time: v })} />
+                </label>
+              </div>
+              <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 13 }}>
+                總時長：{durationHoursBetween(fixedForm.start_time, fixedForm.end_time) || 0} 小時
+              </p>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <label>
+                  起始月份
+                  <input
+                    type="month"
+                    required
+                    value={fixedForm.start_month}
+                    onChange={(e) =>
+                      setFixedForm({
+                        ...fixedForm,
+                        start_month: e.target.value,
+                        end_month: shiftMonth(e.target.value, (schoolSettings?.default_schedule_span_months || 4) - 1),
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  結束月份
+                  <input type="month" value={fixedForm.end_month} onChange={(e) => setFixedForm({ ...fixedForm, end_month: e.target.value })} />
+                </label>
+              </div>
+              <div>
+                <button type="submit">新增</button>{' '}
+                <button type="button" onClick={cancelAddClass}>取消</button>
+              </div>
+            </form>
+          )}
+        </div>
       )}
 
       {notice && (

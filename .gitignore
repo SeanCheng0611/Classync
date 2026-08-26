@@ -7,3 +7,4 @@ server/*.log
 client/*.log
 dist/
 .claude/settings.local.json
+backups/

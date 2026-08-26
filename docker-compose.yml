@@ -1,0 +1,32 @@
+# Phase 0 Infrastructure：只跑 backend（含 SQLite）。
+# Frontend 目前透過既有 Git 自動部署機制由 backend 直接服務 client/dist 靜態檔（見 server/src/index.js），
+# 不強制另外 Dockerize frontend。
+#
+# backend 用 bind mount 把整個 repo 掛進 container，對齊現有「git pull 落地 → node --watch 自動重啟」
+# 的自動部署機制（server/src/routes/deploy.js），container 化後這套流程不需要改。
+# node_modules 用 anonymous volume 蓋掉 bind mount，避免 container 內用 npm ci 裝好的
+# （Linux 原生）依賴被 host（Windows）目錄結構蓋掉。
+#
+# app.db 用 named volume（sqlite_data）持久化，跟 container 生命週期脫鉤；
+# 第一次啟動前需要手動把既有的 server/data/app.db 匯入這個 volume，見 README「Database」章節。
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "${PORT:-4000}:4000"
+    env_file:
+      - server/.env
+    environment:
+      - PORT=4000
+    volumes:
+      - .:/app
+      - /app/node_modules
+      - /app/server/node_modules
+      - /app/client/node_modules
+      - sqlite_data:/app/server/data
+    restart: unless-stopped
+
+volumes:
+  sqlite_data:

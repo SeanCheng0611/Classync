@@ -63,6 +63,67 @@ cd client && npm install && npm run dev   # http://localhost:5173
 
 **注意**：不要把 `client/.env.development` 的 `VITE_API_URL` 寫死成固定網址，因為 `localhost` 與 IP 位址在瀏覽器眼中是不同的 cookie「site」，寫死會導致其中一種存取方式的登入 cookie 被擋掉。保持自動偵測即可同時支援兩種存取方式。
 
+## Docker（Infrastructure，選用）
+
+目前主要部署方式仍是「本機常駐 + Git 自動部署」（見下方「自動部署」），Docker 是額外提供的
+可移植跑法，換開發機或換伺服器時不用重新手動裝 Node 版本、建目錄。兩種跑法互不衝突，挑一種用即可。
+
+```powershell
+docker compose up -d --build   # 啟動（第一次或程式碼變動後）
+docker compose logs -f         # 看 log
+docker compose ps              # 看狀態
+docker compose down            # 停止（不會刪資料，volume 保留）
+```
+
+Backend container 用 bind mount 把整個專案目錄掛進去，所以既有的自動部署 webhook
+（`git pull` + 重新 build client，見 `docs/DEPLOY_AUTO_PULL.md`）在 container 裡跑法完全一樣，
+不需要另外改部署流程。`server/.env` 要先準備好（複製 `server/.env.example`），docker-compose 會自動讀取。
+
+**在正式在跑服務的機器上要切換成 Docker 時**：`git push` 只會透過既有的自動部署 webhook
+觸發 `git pull`，**不會自動啟動 Docker**——這些 Docker 設定檔本身是無害的靜態檔案，pull 下來也
+不影響原本 bare-metal 跑法一根汗毛，正式切換永遠是你自己在那台機器上手動執行 `docker compose up`
+才會發生的事。建議每次要切換前：
+1. 先用替代 port（例如 `$env:PORT=4002; docker compose up -d backend`）跑一次、照上面「Database」
+   章節的步驟匯入資料、實際查過資料筆數確認無誤，完全不會動到正式在跑的 port（通常是 4000）。
+2. 確認沒問題後，才停掉原本 bare-metal 的 process、把 Docker 改成監聽正式 port 重新啟動。
+3. 若要退回 bare-metal，直接 `docker compose down`（不加 `-v`，volume 資料還在），重新
+   `node --watch src/index.js` 即可，`server/data/app.db` 本身沒被動過。
+
+## Database
+
+- 資料庫是 SQLite（Node 內建 `node:sqlite`，非 better-sqlite3），檔案位置 `server/data/app.db`
+  （WAL 模式，另有 `.db-wal` / `.db-shm`）。Schema 與 migration 邏輯見 `server/src/db/index.js`，
+  開機時自動套用，不需要手動下 migration 指令。
+- **用 Docker 跑之前，如果 `server/data/` 已經有既有資料**，named volume（`sqlite_data`）是空的，
+  需要先把現有 `app.db` 匯入進去一次。
+
+  ⚠️ **務必照下面的步驟做，不要用 `docker compose cp` / `docker compose exec` 對著「已經在跑（或有
+  `restart: unless-stopped` 政策、隨時可能被自動拉起）」的 backend service 動資料庫檔案**——這樣做
+  曾經在測試時造成資料被清空（container 自己開機時建立的空白資料庫殘留 WAL 側檔，被誤判為已匯入，
+  重啟後舊的空白內容蓋掉了剛複製進去的正式資料）。正確做法是全程只用**一次性、不帶 restart 政策的
+  `docker compose run --rm` container**，不牽涉任何常駐 process：
+
+  ```powershell
+  docker compose down   # 確保沒有任何 backend container 正在跑
+
+  # 用一次性 container，把 host 的 server/data 唯讀掛進去，在 container 內部直接複製
+  # （不要用 docker compose cp，那是透過 tar 傳輸，需要目標 container 存在/在跑，容易跟其他操作競速）
+  docker compose run --rm --no-deps `
+    -v "${PWD}\server\data:/host-data:ro" `
+    --entrypoint sh backend `
+    -c "rm -f /app/server/data/app.db /app/server/data/app.db-wal /app/server/data/app.db-shm; cp /host-data/app.db /app/server/data/app.db"
+
+  docker compose up -d backend   # 這時才啟動常駐服務
+  ```
+
+  之後同一台機器上就會持續使用這個 volume，不用再重複這個步驟。建議匯入後先查一次實際資料筆數
+  （不要只比對檔案大小——檔案大小相同不代表內容正確）：
+  ```powershell
+  docker compose exec backend node -e "const{DatabaseSync}=require('node:sqlite');const db=new DatabaseSync('/app/server/data/app.db');console.log(db.prepare('SELECT COUNT(*) c FROM students').get())"
+  ```
+- 備份：`.\scripts\backup-db.ps1`（或 Linux/Mac 用 `scripts/backup-db.sh`），會把目前的
+  `app.db` 複製一份到 `backups/`（已 gitignore，不會進 git）。
+
 ## 已知限制 / 待辦
 
 - 目前僅支援本機常駐部署，未提供雲端部署設定。
