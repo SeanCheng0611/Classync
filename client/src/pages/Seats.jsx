@@ -27,29 +27,27 @@ function blockForSession(session, blocks) {
   return blocks[0];
 }
 
-// 「上課資訊」／「已排座位清單」兩張表共用同一組固定欄寬，讓上下欄位對齊，且不會隨學生姓名變多而跑版；
-// 教師/學生姓名改用直式文字（不管幾個字都只佔固定寬度，只會影響列高），把橫向空間留給「時段」「桌號」完整顯示
-function ScheduleColGroup({ mode }) {
+// 「上課資訊」／「已排座位清單」兩張表共用同一組固定欄寬，讓上下欄位對齊；
+// 時間/教師/科目欄位內容通常不長，寬度抓夠讓它們單行顯示，剩下空間留給學生欄位
+function ScheduleColGroup() {
   return (
     <colgroup>
-      <col style={{ width: 60 }} />
-      <col style={{ width: 26 }} />
-      <col style={{ width: 26 }} />
-      <col style={{ width: 32 }} />
-      {mode === 'double' && <col style={{ width: 76 }} />}
-      <col style={{ width: 72 }} />
+      <col style={{ width: 82 }} />
+      <col style={{ width: 62 }} />
+      <col style={{ width: 46 }} />
+      <col />
     </colgroup>
   );
 }
 
-// 直式文字：每個字往下疊，欄寬只需容納一個字的寬度，不會因為名字字數變多而變寬，只會讓列變高
-const verticalTextStyle = { writingMode: 'vertical-rl', textOrientation: 'upright', whiteSpace: 'nowrap', textAlign: 'center' };
+const CELL_PADDING = '8px 6px';
+const nowrapCellStyle = { whiteSpace: 'nowrap', padding: CELL_PADDING };
 
 const studentCellStyle = (expanded, clickable) => ({
   cursor: clickable ? 'pointer' : 'default',
-  ...(expanded
-    ? { whiteSpace: 'normal', wordBreak: 'break-all' }
-    : verticalTextStyle),
+  whiteSpace: expanded ? 'normal' : 'nowrap',
+  wordBreak: expanded ? 'break-all' : 'normal',
+  padding: CELL_PADDING,
 });
 
 function StudentCell({ session, expanded, onToggle }) {
@@ -63,8 +61,6 @@ function StudentCell({ session, expanded, onToggle }) {
     </td>
   );
 }
-
-const compactSelectStyle = { width: '100%', fontSize: 12, padding: '2px 0' };
 
 function sameStudents(seat, session) {
   const studentIds = session.students.map((s) => s.id);
@@ -85,10 +81,11 @@ export default function Seats() {
   const [sessions, setSessions] = useState([]);
   const [teachers, setTeachers] = useState([]);
   const [seatsByBlock, setSeatsByBlock] = useState({});
-  const [seatLayout, setSeatLayout] = useState(DEFAULT_SEAT_LAYOUT);
+  const [seatLayout, setSeatLayout] = useState(null); // null＝版面資料還沒讀回來，避免切頁時先閃一下預設 13 桌版面才換成實際版面
   const [draggedSeat, setDraggedSeat] = useState(null);
   const [draggedSession, setDraggedSession] = useState(null);
   const [draggedAssignment, setDraggedAssignment] = useState(null); // { seatNumber, blockKey }：拖曳單一時段格子時的來源
+  const [dragOverTarget, setDragOverTarget] = useState(null); // 目前拖曳懸停中的目標 key，用來顯示可否放置的即時提示
   const [deleteSeatMode, setDeleteSeatMode] = useState(false);
   const [error, setError] = useState('');
   const [exporting, setExporting] = useState(false);
@@ -96,7 +93,7 @@ export default function Seats() {
   const [expandedRows, setExpandedRows] = useState(new Set());
   const [blockOverrides, setBlockOverrides] = useState({}); // { [sessionId]: blockKey }，手動覆蓋「上課資訊」判斷的時段
 
-  const seatNumbers = seatLayout.flat();
+  const seatNumbers = seatLayout ? seatLayout.flat() : [];
 
   const blocks =
     mode === 'single'
@@ -114,9 +111,14 @@ export default function Seats() {
     setTeachers(te);
     try {
       const layout = JSON.parse(sch.seat_layout);
-      if (Array.isArray(layout) && layout.length > 0) setSeatLayout(layout);
+      if (Array.isArray(layout) && layout.length > 0) {
+        setSeatLayout(layout);
+      } else {
+        // 版面資料異常/空白：如果畫面上已經有讀到過的版面就維持現狀，只有從沒讀過（新補習班）才退回預設值
+        setSeatLayout((prev) => prev ?? DEFAULT_SEAT_LAYOUT);
+      }
     } catch {
-      // 版面資料異常時維持目前畫面上的版面，不覆蓋成預設值
+      setSeatLayout((prev) => prev ?? DEFAULT_SEAT_LAYOUT);
     }
   }, [currentSchoolId, date]);
 
@@ -149,6 +151,14 @@ export default function Seats() {
   }, [currentSchoolId, load, loadSeats]);
 
   const teacherName = (id) => teachers.find((t) => t.id === id)?.name || '';
+
+  // 判斷某桌在目前所有時段是否完全沒有排課；只有完全空桌才能拖曳搬移「桌子本身的位置」，
+  // 有課堂的桌子拖曳只能跟別桌互換課堂資訊，不會更動桌號版面
+  const isSeatEmpty = (seatNumber) =>
+    blocks.every((b) => {
+      const seat = (seatsByBlock[b.key] || []).find((s) => s.seat_number === seatNumber);
+      return !seat || (!seat.teacher_id && seat.students.length === 0);
+    });
 
   const toggleRowExpanded = (sessionId) => {
     setExpandedRows((prev) => {
@@ -184,37 +194,6 @@ export default function Seats() {
       if (seat) return { block: b, seat };
     }
     return null;
-  };
-
-  // 手動改「上課資訊」的時段欄位：如果這堂課已經排過座位，要把座位資料一併搬到新時段，
-  // 不然座位資料會留在舊時段變成孤兒資料，跟「上課資訊」/「已排座位清單」的判斷對不上
-  const changeSessionBlock = async (session, newBlockKey) => {
-    setError('');
-    const oldBlock = resolvedBlock(session);
-    const newBlock = blocks.find((b) => b.key === newBlockKey);
-    if (!newBlock || oldBlock.key === newBlockKey) {
-      setBlockOverrides({ ...blockOverrides, [session.id]: newBlockKey });
-      return;
-    }
-    const oldBlockSeats = seatsByBlock[oldBlock.key] || [];
-    const existing = oldBlockSeats.find((s) => s.teacher_id === session.teacher_id && sameStudents(s, session));
-    try {
-      if (existing) {
-        await api.del(
-          `/api/schools/${currentSchoolId}/seats/${existing.seat_number}?date=${date}&time_slot=${timeToSlot(oldBlock.start)}`
-        );
-        await api.put(`/api/schools/${currentSchoolId}/seats/${existing.seat_number}`, {
-          date,
-          time_slot: timeToSlot(newBlock.start),
-          teacher_id: session.teacher_id,
-          student_ids: session.students.slice(0, 2).map((s) => s.id),
-        });
-      }
-      setBlockOverrides({ ...blockOverrides, [session.id]: newBlockKey });
-      loadSeats();
-    } catch (err) {
-      setError(err.message);
-    }
   };
 
   const assignSeat = async (session, newSeatNumber) => {
@@ -291,6 +270,7 @@ export default function Seats() {
 
   // 新增座位：由使用者輸入要新增的桌號；接在最後一排後面，該排未滿 4 個就補進去，滿了就另開新的一排
   const addSeat = async () => {
+    if (!seatLayout) return;
     setError('');
     const input = prompt('請輸入要新增的桌號：');
     if (input === null) return;
@@ -380,8 +360,31 @@ export default function Seats() {
     );
   };
 
+  // 兩桌都是空桌時，直接互換桌號本身（版面位置對調）；反正兩邊都沒課堂資料可換，跟一般的
+  // 「有課堂只能換資料」規則不衝突——只有這種兩邊皆空的情況，拖曳才會真的搬動桌號版面
+  const swapSeatPositions = async (seatA, seatB) => {
+    if (!seatLayout || seatA === seatB) return;
+    const newLayout = seatLayout.map((row) => row.map((n) => (n === seatA ? seatB : n === seatB ? seatA : n)));
+    setSeatLayout(newLayout);
+    try {
+      await api.put(`/api/schools/${currentSchoolId}/seat-layout`, { layout: newLayout });
+    } catch (err) {
+      setError(err.message);
+      load();
+    }
+  };
+
+  // 拖曳整桌丟到另一張桌子：兩邊都空桌就對調桌號位置，否則維持原本的規則（只換課堂資料，不動位置）
+  const dropSeatOnSeat = (seatA, seatB) => {
+    if (isSeatEmpty(seatA) && isSeatEmpty(seatB)) {
+      return swapSeatPositions(seatA, seatB);
+    }
+    return swapSeatAssignments(seatA, seatB);
+  };
+
   // 刪除座位：直接從版面上移除該桌號，不影響已產生的課堂/出缺勤紀錄
   const deleteSeat = async (seatNumber) => {
+    if (!seatLayout) return;
     if (!confirm(`確定要刪除 ${seatNumber} 號桌嗎？`)) return;
     setError('');
     const newLayout = seatLayout.map((row) => row.filter((n) => n !== seatNumber)).filter((row) => row.length > 0);
@@ -467,6 +470,7 @@ export default function Seats() {
 
   // 拖曳到某一排的空位：把座位從原本的位置移出，接到目標排的最後面（該排最多 4 個，畫面上空位只會出現在未滿的排尾）
   const moveSeatToRow = async (seatNumber, targetRowIdx) => {
+    if (!seatLayout) return;
     const newLayout = seatLayout.map((row) => row.filter((n) => n !== seatNumber));
     if (newLayout[targetRowIdx].length >= 4) return;
     newLayout[targetRowIdx].push(seatNumber);
@@ -613,148 +617,126 @@ export default function Seats() {
         <div style={{ flex: '0 0 380px' }}>
           <h3 style={{ margin: '0 0 6px' }}>上課資訊</h3>
           <table style={{ width: '100%', tableLayout: 'fixed', borderCollapse: 'collapse', fontSize: 13 }}>
-            <ScheduleColGroup mode={mode} />
+            <ScheduleColGroup />
             <thead>
               <tr style={{ textAlign: 'left', borderBottom: '2px solid var(--border-strong)' }}>
-                <th>時間</th>
-                <th>教師</th>
-                <th>科目</th>
-                <th>學生</th>
-                {mode === 'double' && <th>時段</th>}
-                <th>桌號</th>
+                <th style={nowrapCellStyle}>時間</th>
+                <th style={nowrapCellStyle}>教師</th>
+                <th style={nowrapCellStyle}>科目</th>
+                <th style={{ padding: CELL_PADDING }}>學生</th>
               </tr>
             </thead>
             <tbody>
               {daySessions.map((session) => {
-                const block = resolvedBlock(session);
-                const blockSeats = seatsByBlock[block.key] || [];
-                const assigned = blockSeats.find((s) => s.teacher_id === session.teacher_id && sameStudents(s, session));
                 const tooManyStudents = session.students.length > 2;
-                const occupiedByOtherTeacher = new Set(
-                  blockSeats.filter((s) => s.teacher_id && s.teacher_id !== session.teacher_id).map((s) => s.seat_number)
-                );
                 const draggableRow = isAdmin && !tooManyStudents;
                 return (
                   <tr
                     key={session.id}
                     draggable={draggableRow}
                     onDragStart={() => draggableRow && setDraggedSession(session)}
-                    onDragEnd={() => setDraggedSession(null)}
+                    onDragEnd={() => {
+                      setDraggedSession(null);
+                      setDragOverTarget(null);
+                    }}
                     style={{
                       borderBottom: '1px solid var(--border)',
                       cursor: draggableRow ? 'grab' : 'default',
                       opacity: draggedSession?.id === session.id ? 0.5 : 1,
                     }}
                   >
-                    <td>{slotRangeLabel(session.start_slot, session.duration_slots)}</td>
-                    <td style={verticalTextStyle}>{teacherName(session.teacher_id)}</td>
-                    <td style={verticalTextStyle}>{session.subject}</td>
+                    <td style={nowrapCellStyle}>{slotRangeLabel(session.start_slot, session.duration_slots)}</td>
+                    <td style={nowrapCellStyle}>{teacherName(session.teacher_id)}</td>
+                    <td style={nowrapCellStyle}>{session.subject}</td>
                     <StudentCell
                       session={session}
                       expanded={expandedRows.has(session.id)}
                       onToggle={() => toggleRowExpanded(session.id)}
                     />
-                    {mode === 'double' && (
-                      <td>
-                        {isAdmin ? (
-                          <select
-                            value={block.key}
-                            onChange={(e) => changeSessionBlock(session, e.target.value)}
-                            style={compactSelectStyle}
-                          >
-                            {DOUBLE_BLOCKS.map((b) => (
-                              <option key={b.key} value={b.key}>{b.label}</option>
-                            ))}
-                          </select>
-                        ) : (
-                          block.label
-                        )}
-                      </td>
-                    )}
-                    <td>
-                      {tooManyStudents ? (
-                        <span style={{ color: 'var(--text-muted)' }}>超過2人</span>
-                      ) : isAdmin ? (
-                        <select
-                          value={assigned?.seat_number || ''}
-                          onChange={(e) => assignSeat(session, e.target.value ? Number(e.target.value) : null)}
-                          style={compactSelectStyle}
-                        >
-                          <option value="">未安排</option>
-                          {seatNumbers.filter((n) => n === assigned?.seat_number || !occupiedByOtherTeacher.has(n)).map((n) => (
-                            <option key={n} value={n}>{n}</option>
-                          ))}
-                        </select>
-                      ) : (
-                        assigned?.seat_number || '未安排'
-                      )}
-                    </td>
                   </tr>
                 );
               })}
               {daySessions.length === 0 && (
-                <tr><td colSpan={mode === 'double' ? 6 : 5} style={{ color: 'var(--text-muted)', padding: 12 }}>這天沒有課</td></tr>
+                <tr><td colSpan={4} style={{ color: 'var(--text-muted)', padding: 12 }}>這天沒有課</td></tr>
               )}
             </tbody>
           </table>
 
           <h3 style={{ margin: '16px 0 6px' }}>已排座位清單</h3>
           <table style={{ width: '100%', tableLayout: 'fixed', borderCollapse: 'collapse', fontSize: 13 }}>
-            <ScheduleColGroup mode={mode} />
+            <ScheduleColGroup />
             <thead>
               <tr style={{ textAlign: 'left', borderBottom: '2px solid var(--border-strong)' }}>
-                <th>時間</th>
-                <th>教師</th>
-                <th>科目</th>
-                <th>學生</th>
-                {mode === 'double' && <th>時段</th>}
-                <th>桌號</th>
+                <th style={nowrapCellStyle}>時間</th>
+                <th style={nowrapCellStyle}>教師</th>
+                <th style={nowrapCellStyle}>科目</th>
+                <th style={{ padding: CELL_PADDING }}>學生</th>
               </tr>
             </thead>
             <tbody>
-              {seatedSessions.map(({ session, block, assigned }) => (
+              {seatedSessions.map(({ session }) => (
                 <tr key={session.id} style={{ borderBottom: '1px solid var(--border)' }}>
-                  <td>{slotRangeLabel(session.start_slot, session.duration_slots)}</td>
-                  <td style={verticalTextStyle}>{teacherName(session.teacher_id)}</td>
-                  <td style={verticalTextStyle}>{session.subject}</td>
+                  <td style={nowrapCellStyle}>{slotRangeLabel(session.start_slot, session.duration_slots)}</td>
+                  <td style={nowrapCellStyle}>{teacherName(session.teacher_id)}</td>
+                  <td style={nowrapCellStyle}>{session.subject}</td>
                   <StudentCell
                     session={session}
                     expanded={expandedRows.has(session.id)}
                     onToggle={() => toggleRowExpanded(session.id)}
                   />
-                  {mode === 'double' && <td>{block.label}</td>}
-                  <td>{assigned.seat_number}</td>
                 </tr>
               ))}
               {seatedSessions.length === 0 && (
-                <tr><td colSpan={mode === 'double' ? 6 : 5} style={{ color: 'var(--text-muted)', padding: 12 }}>尚無已排座位的學生</td></tr>
+                <tr><td colSpan={4} style={{ color: 'var(--text-muted)', padding: 12 }}>尚無已排座位的學生</td></tr>
               )}
             </tbody>
           </table>
         </div>
 
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {seatLayout.map((row, rowIdx) => {
+          {!seatLayout && <p style={{ color: 'var(--text-muted)' }}>載入座位版面中...</p>}
+          {seatLayout && seatLayout.map((row, rowIdx) => {
             const slots = [...row, ...Array(Math.max(0, 4 - row.length)).fill(null)];
             return (
               <div key={rowIdx} style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }}>
-                {slots.map((n, slotIdx) =>
-                  n == null ? (
-                    <div
-                      key={`empty-${rowIdx}-${slotIdx}`}
-                      style={{
-                        minHeight: 150,
-                        borderRadius: 'var(--radius)',
-                        border: isAdmin ? '1px dashed var(--border-strong)' : 'none',
-                      }}
-                      onDragOver={(e) => isAdmin && e.preventDefault()}
-                      onDrop={(e) => {
-                        e.preventDefault();
-                        if (draggedSeat != null) moveSeatToRow(draggedSeat, rowIdx);
-                        setDraggedSeat(null);
-                      }}
-                    />
-                  ) : (
+                {slots.map((n, slotIdx) => {
+                  if (n == null) {
+                    // 拖到這個空位＝把桌子搬過來這裡；只有空桌才能這樣移動位置，有課堂的桌子拖過來不會有作用
+                    const targetKey = `empty-${rowIdx}-${slotIdx}`;
+                    const isHovered = dragOverTarget === targetKey;
+                    const hoverValid = isHovered && draggedSeat != null && isSeatEmpty(draggedSeat);
+                    const hoverInvalid = isHovered && draggedSeat != null && !isSeatEmpty(draggedSeat);
+                    return (
+                      <div
+                        key={targetKey}
+                        style={{
+                          minHeight: 150,
+                          borderRadius: 'var(--radius)',
+                          border: hoverInvalid
+                            ? '1px dashed var(--danger)'
+                            : hoverValid
+                            ? '1px dashed var(--accent)'
+                            : isAdmin
+                            ? '1px dashed var(--border-strong)'
+                            : 'none',
+                          background: hoverValid ? 'var(--accent-soft)' : undefined,
+                          cursor: hoverInvalid ? 'not-allowed' : undefined,
+                        }}
+                        onDragOver={(e) => isAdmin && e.preventDefault()}
+                        onDragEnter={() => isAdmin && setDragOverTarget(targetKey)}
+                        onDragLeave={() => setDragOverTarget((k) => (k === targetKey ? null : k))}
+                        onDrop={(e) => {
+                          e.preventDefault();
+                          if (draggedSeat != null && isSeatEmpty(draggedSeat)) {
+                            moveSeatToRow(draggedSeat, rowIdx);
+                          }
+                          setDraggedSeat(null);
+                          setDragOverTarget(null);
+                        }}
+                      />
+                    );
+                  }
+                  return (
                     <div
                       key={n}
                       data-seat={n}
@@ -771,17 +753,27 @@ export default function Seats() {
                           assignSeat(draggedSession, n);
                           setDraggedSession(null);
                         } else if (draggedSeat != null) {
-                          swapSeatAssignments(draggedSeat, n);
+                          dropSeatOnSeat(draggedSeat, n);
                         }
                         setDraggedSeat(null);
+                        setDragOverTarget(null);
                       }}
                     >
                       <div
                         draggable={isAdmin}
                         onDragStart={() => setDraggedSeat(n)}
-                        onDragEnd={() => setDraggedSeat(null)}
+                        onDragEnd={() => {
+                          setDraggedSeat(null);
+                          setDragOverTarget(null);
+                        }}
                         style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: isAdmin ? 'grab' : 'default' }}
-                        title={isAdmin ? '拖曳可整桌互換兩個時段的資料，或拖到空位移動桌子位置' : undefined}
+                        title={
+                          isAdmin
+                            ? isSeatEmpty(n)
+                              ? '拖曳可移動桌子位置，或跟其他桌互換課堂資訊'
+                              : '此桌已有課堂：拖曳只能跟其他桌互換課堂資訊，無法移動位置'
+                            : undefined
+                        }
                       >
                         <strong>{n} 號桌</strong>
                         {isAdmin && deleteSeatMode && (
@@ -811,6 +803,8 @@ export default function Seats() {
                         const isDraggingThis = draggedAssignment?.seatNumber === n && draggedAssignment?.blockKey === b.key;
                         const blockCellKey = `${n}:${b.key}`;
                         const namesExpanded = expandedBlocks.has(blockCellKey);
+                        const blockTargetKey = `block-${blockCellKey}`;
+                        const isBlockHovered = dragOverTarget === blockTargetKey;
                         return (
                           <div
                             key={b.key}
@@ -819,11 +813,23 @@ export default function Seats() {
                               e.stopPropagation();
                               setDraggedAssignment({ seatNumber: n, blockKey: b.key });
                             }}
-                            onDragEnd={() => setDraggedAssignment(null)}
+                            onDragEnd={() => {
+                              setDraggedAssignment(null);
+                              setDragOverTarget(null);
+                            }}
                             onDragOver={(e) => {
                               if (!isAdmin) return;
                               e.preventDefault();
                               e.stopPropagation();
+                            }}
+                            onDragEnter={(e) => {
+                              if (!isAdmin) return;
+                              e.stopPropagation();
+                              setDragOverTarget(blockTargetKey);
+                            }}
+                            onDragLeave={(e) => {
+                              e.stopPropagation();
+                              setDragOverTarget((k) => (k === blockTargetKey ? null : k));
                             }}
                             onDrop={(e) => {
                               e.preventDefault();
@@ -834,59 +840,61 @@ export default function Seats() {
                               } else if (draggedAssignment) {
                                 swapBlockAssignment(draggedAssignment.seatNumber, draggedAssignment.blockKey, n, b.key);
                               } else if (draggedSeat != null) {
-                                swapSeatAssignments(draggedSeat, n);
+                                dropSeatOnSeat(draggedSeat, n);
                               }
                               setDraggedAssignment(null);
                               setDraggedSeat(null);
+                              setDragOverTarget(null);
                             }}
                             style={{
                               marginTop: 6,
                               fontSize: 13,
-                              height: 'auto',
+                              minHeight: 42, // 固定最小高度，讓「未安排」跟排好課堂的格子大小一致，指派/清空時不會跳動
                               overflow: 'visible',
-                              padding: 2,
+                              padding: 4,
                               borderRadius: 4,
+                              border: '1px solid var(--border)',
                               cursor: isAdmin ? 'grab' : 'default',
                               opacity: isDraggingThis ? 0.5 : 1,
+                              background: isBlockHovered ? 'var(--accent-soft)' : undefined,
+                              boxShadow: isDraggingThis ? 'inset 0 0 0 1px var(--accent)' : undefined,
                             }}
                           >
-                            {b.label && <div style={{ color: 'var(--text-muted)' }}>{b.label}</div>}
-                            {hasAssignment ? (
-                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 4 }}>
-                                <div style={{ minWidth: 0 }}>
-                                  <div style={{ fontWeight: 600, wordBreak: 'break-word' }}>{teacherName(seat.teacher_id) || '未安排教師'}</div>
-                                  <div
-                                    style={{
-                                      color: 'var(--text-muted)',
-                                      display: 'flex',
-                                      alignItems: 'flex-start',
-                                      gap: 4,
-                                      flexWrap: 'wrap',
-                                    }}
+                            {(b.label || (isAdmin && hasAssignment)) && (
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 4 }}>
+                                <span style={{ color: 'var(--text-muted)' }}>{b.label}</span>
+                                {isAdmin && hasAssignment && (
+                                  <button
+                                    style={{ fontSize: 11, padding: '2px 6px', flexShrink: 0 }}
+                                    onClick={() => clearBlockSeat(n, b)}
                                   >
-                                    <span style={{ wordBreak: 'break-word', whiteSpace: 'normal' }}>
-                                      {namesExpanded
-                                        ? seat.students.map((s) => s.name).join('、') || '未安排學生'
-                                        : (seat.students[0]?.name || '未安排學生')}
-                                    </span>
-                                    {seat.students.length > 1 && (
-                                      <span
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          toggleBlockExpanded(blockCellKey);
-                                        }}
-                                        title={namesExpanded ? '收合' : `共 ${seat.students.length} 位學生`}
-                                        style={{ flexShrink: 0, fontSize: 9, color: 'var(--text-muted)', cursor: 'pointer' }}
-                                      >
-                                        {namesExpanded ? '▲' : '▼'}
-                                      </span>
-                                    )}
-                                  </div>
-                                </div>
-                                {isAdmin && (
-                                  <button style={{ fontSize: 11, flexShrink: 0 }} onClick={() => clearBlockSeat(n, b)}>
                                     清空
                                   </button>
+                                )}
+                              </div>
+                            )}
+                            {hasAssignment ? (
+                              <div style={{ minWidth: 0, display: 'flex', alignItems: 'flex-start', gap: 4, flexWrap: 'wrap' }}>
+                                <span style={{ wordBreak: 'break-word' }}>
+                                  <strong>{teacherName(seat.teacher_id) || '未安排教師'}</strong>
+                                  <span style={{ color: 'var(--text-muted)' }}>
+                                    -
+                                    {namesExpanded
+                                      ? seat.students.map((s) => s.name).join('、') || '未安排學生'
+                                      : (seat.students[0]?.name || '未安排學生')}
+                                  </span>
+                                </span>
+                                {seat.students.length > 1 && (
+                                  <span
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      toggleBlockExpanded(blockCellKey);
+                                    }}
+                                    title={namesExpanded ? '收合' : `共 ${seat.students.length} 位學生`}
+                                    style={{ flexShrink: 0, fontSize: 9, color: 'var(--text-muted)', cursor: 'pointer' }}
+                                  >
+                                    {namesExpanded ? '▲' : '▼'}
+                                  </span>
                                 )}
                               </div>
                             ) : (
@@ -896,8 +904,8 @@ export default function Seats() {
                         );
                       })}
                     </div>
-                  )
-                )}
+                  );
+                })}
               </div>
             );
           })}
