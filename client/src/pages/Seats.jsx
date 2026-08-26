@@ -27,15 +27,14 @@ function blockForSession(session, blocks) {
   return blocks[0];
 }
 
-// 「上課資訊」／「已排座位清單」兩張表共用同一組固定欄寬，讓上下欄位對齊；
-// 時間/教師/科目欄位內容通常不長，寬度抓夠讓它們單行顯示，剩下空間留給學生欄位
+// 「上課資訊」／「已排座位清單」兩張表共用同一組固定欄寬，讓上下欄位對齊；四欄平均分配寬度
 function ScheduleColGroup() {
   return (
     <colgroup>
-      <col style={{ width: 82 }} />
-      <col style={{ width: 62 }} />
-      <col style={{ width: 46 }} />
-      <col />
+      <col style={{ width: '25%' }} />
+      <col style={{ width: '25%' }} />
+      <col style={{ width: '25%' }} />
+      <col style={{ width: '25%' }} />
     </colgroup>
   );
 }
