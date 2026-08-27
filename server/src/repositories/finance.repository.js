@@ -5,10 +5,65 @@ import { db } from '../db/index.js';
 // 跟 Wave 2 的 scheduling.repository.js 是同樣的理由，不強行拆開。
 //
 // Wave 3A 範圍：讀取查詢 + 低風險單表 CRUD（ledger_entries、tuition_records）。
-// 「建立/刪除繳費單＋明細」「建立/刪除薪資條＋明細」這類跨表 atomic 操作刻意不搬進來，
-// 留給 Wave 3B（見 docs/FINANCE_TRANSACTION_INVENTORY.md），routes/invoices.js、routes/payslips.js
-// 的 POST/DELETE 目前仍直接用 db，這是有意保留、已記錄的技術債，不是遺漏。
+// Wave 3B 補上「建立/刪除繳費單＋明細」「建立/刪除薪資條＋明細」的細粒度 persistence 方法
+// （insertInvoice/insertInvoiceItems/deleteInvoiceLedgerEntries/deleteInvoiceRow 等）——
+// 這些方法本身「不」自帶 transaction（不像 Wave 2 的 scheduling.repository 有幾個方法會自己
+// runInTransaction），因為這幾個 use case 的 transaction 需要橫跨 financeRepository 之外的
+// trash 寫入（`services/trash.js` 的 `insertTrashRow`），transaction ownership 因此上移到
+// services/finance.js，由 service 組合呼叫多個「不自帶 transaction」的細粒度方法，見
+// docs/REPOSITORY_ARCHITECTURE.md 的 Finance Transaction Boundary 段落。
 export const financeRepository = {
+  // ---- invoices / invoice_items（write，Wave 3B）----
+
+  insertInvoice({ id, schoolId, studentId, totalAmount, note }) {
+    db.prepare(`INSERT INTO invoices (id, school_id, student_id, total_amount, note) VALUES (?, ?, ?, ?, ?)`).run(
+      id,
+      schoolId,
+      studentId,
+      totalAmount,
+      note ?? null
+    );
+  },
+
+  insertInvoiceItems(invoiceId, items) {
+    const insert = db.prepare('INSERT INTO invoice_items (id, invoice_id, session_id, unit_price) VALUES (?, ?, ?, ?)');
+    for (const item of items) insert.run(item.id, invoiceId, item.sessionId, item.unitPrice);
+  },
+
+  deleteInvoiceLedgerEntries(invoiceId) {
+    db.prepare('DELETE FROM ledger_entries WHERE related_invoice_id = ?').run(invoiceId);
+  },
+
+  // invoice_items 靠 schema 的 ON DELETE CASCADE 外鍵自動清除，不需要應用層額外 DELETE
+  deleteInvoiceRow(schoolId, id) {
+    db.prepare('DELETE FROM invoices WHERE id = ? AND school_id = ?').run(id, schoolId);
+  },
+
+  // ---- payslips / payslip_items（write，Wave 3B）----
+
+  insertPayslip({ id, schoolId, teacherId, totalAmount, note }) {
+    db.prepare(`INSERT INTO payslips (id, school_id, teacher_id, total_amount, note) VALUES (?, ?, ?, ?, ?)`).run(
+      id,
+      schoolId,
+      teacherId,
+      totalAmount,
+      note ?? null
+    );
+  },
+
+  insertPayslipItems(payslipId, items) {
+    const insert = db.prepare('INSERT INTO payslip_items (id, payslip_id, session_id, hours, rate, pay) VALUES (?, ?, ?, ?, ?, ?)');
+    for (const item of items) insert.run(item.id, payslipId, item.sessionId, item.hours, item.rate, item.pay);
+  },
+
+  deletePayslipLedgerEntries(payslipId) {
+    db.prepare('DELETE FROM ledger_entries WHERE related_payslip_id = ?').run(payslipId);
+  },
+
+  // payslip_items 靠 schema 的 ON DELETE CASCADE 外鍵自動清除，不需要應用層額外 DELETE
+  deletePayslipRow(schoolId, id) {
+    db.prepare('DELETE FROM payslips WHERE id = ? AND school_id = ?').run(id, schoolId);
+  },
   // ---- ledger_entries ----
 
   findLedgerEntries(schoolId, { start, end, category } = {}) {
@@ -124,6 +179,18 @@ export const financeRepository = {
     return !!db.prepare('SELECT 1 FROM invoice_items WHERE session_id = ?').get(sessionId);
   },
 
+  // 開立繳費單時驗證單一課堂：須屬於該學生、屬於這間補習班，回傳計價需要的欄位
+  findInvoiceableSessionRow(schoolId, studentId, sessionId) {
+    return db
+      .prepare(
+        `SELECT cs.id, cs.session_date, cs.subject, ss.unit_price
+         FROM class_sessions cs
+         JOIN session_students ss ON ss.session_id = cs.id AND ss.student_id = ?
+         WHERE cs.id = ? AND cs.school_id = ?`
+      )
+      .get(studentId, sessionId, schoolId);
+  },
+
   // ---- payslips（read-only in Wave 3A; create/delete 仍在 routes/payslips.js 直接用 db，見檔案頂端說明）----
 
   findPayslipsByTeacher(schoolId, teacherId) {
@@ -178,6 +245,17 @@ export const financeRepository = {
 
   hasPayslipItemForSession(sessionId) {
     return !!db.prepare('SELECT 1 FROM payslip_items WHERE session_id = ?').get(sessionId);
+  },
+
+  // 開立薪資條時驗證單一課堂：須屬於該教師、屬於這間補習班
+  findPayslipableSessionRow(schoolId, teacherId, sessionId) {
+    return db.prepare('SELECT * FROM class_sessions WHERE id = ? AND school_id = ? AND teacher_id = ?').get(sessionId, schoolId, teacherId);
+  },
+
+  // 沿用原本用 SQLite date('now') 判斷「今天」的寫法（跟 Node Date 在時區語意上可能不同，
+  // 這是既有行為，Wave 3B 不改），給「未來日期不可開薪資」的規則用
+  today() {
+    return db.prepare(`SELECT date('now') as d`).get().d;
   },
 
   // 給薪資試算/開立薪資條頁用：某堂課的學生姓名清單（is_admin 由呼叫端依 length===0 判斷）

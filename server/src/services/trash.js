@@ -181,7 +181,11 @@ export function restoreEntity(entityType, payload) {
 // ---------- 回收桶本體：新增 / 清理過期 ----------
 
 // related：{ studentIds?: string[], teacherId?: string }，讓學生/教師詳細頁的回收桶可以篩出「跟這個人有關」的項目
-export function addToTrash(schoolId, entityType, label, payload, userId, related = {}) {
+// 純寫入，不 broadcast——給需要把「存進回收桶」納入自己的 transaction 的呼叫端用
+// （例如 Wave 3B 的 invoice/payslip 刪除），避免 transaction 中途 rollback 時，
+// broadcast 已經先發出去、通知前端「東西被刪了」但其實整個操作被回滾、資料還在的不一致。
+// 一般情境（沒有跨 repository transaction 需求）請直接用下面的 addToTrash。
+export function insertTrashRow(schoolId, entityType, label, payload, userId, related = {}) {
   const id = nanoid();
   db.prepare(
     `INSERT INTO trash (id, school_id, entity_type, label, payload, related_student_ids, related_teacher_id, deleted_by)
@@ -196,6 +200,11 @@ export function addToTrash(schoolId, entityType, label, payload, userId, related
     related.teacherId || null,
     userId || null
   );
+  return id;
+}
+
+export function addToTrash(schoolId, entityType, label, payload, userId, related = {}) {
+  const id = insertTrashRow(schoolId, entityType, label, payload, userId, related);
   broadcastChange(schoolId, 'trash');
   return id;
 }

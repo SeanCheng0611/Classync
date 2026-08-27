@@ -1,41 +1,71 @@
 # Finance Transaction Inventory
 
-Wave 3A 的交付項目：盤點 Finance domain 裡跨表、需要 atomic 保證的寫入操作，留給 Wave 3B
-（Financial Atomic Transactions）處理。Wave 3A **沒有**搬動這些操作的 transaction boundary，
-它們目前仍是 routes/invoices.js、routes/payslips.js 裡直接呼叫 `db.prepare(...)` 的原始寫法
-（沒有用 `runInTransaction` 包起來，維持 refactor 前的原始行為，不是這個 Wave 新增的風險）。
+Wave 3A 盤點了 Finance domain 裡跨表、需要 atomic 保證的四個寫入操作（Create/Delete Invoice、
+Create/Delete Payslip），當時**沒有**動 transaction boundary。Wave 3B（Financial Atomic
+Transactions）完成了這四個操作的 atomic 化，這份文件記錄 Wave 3B 之後的實際狀態。
+
+## 架構總覽
+
+- Transaction ownership 在 **Service 層**（`server/src/services/finance.js`），不在 Route、也不在
+  Repository。理由：這四個操作除了 `financeRepository` 之外，還需要協調 `services/trash.js` 的
+  `insertTrashRow`（trash capture），單一 repository 方法無法覆蓋跨 repository/service 的寫入範圍，
+  見 `docs/REPOSITORY_ARCHITECTURE.md` 的 Finance Transaction Boundary 段落。
+- Route（`routes/invoices.js`、`routes/payslips.js`）現在**完全不含** `db.prepare`/`db.exec`，
+  只做：解析 request → 呼叫 `financeService.createInvoice(...)` 等 → 把拋出的 `FinanceError`
+  轉回原本的 HTTP status/message → 成功才 `broadcastChange` + `logEvent` + 回應。
+- `financeRepository` 新增的 write 方法（`insertInvoice`/`insertInvoiceItems`/
+  `deleteInvoiceLedgerEntries`/`deleteInvoiceRow` 及 payslip 對應方法）都是單一 SQL statement 的
+  細粒度操作，**不**自帶 `runInTransaction`——不像 Wave 2 的 `scheduling.repository.js` 有些方法會
+  自己包 transaction，這裡刻意讓 transaction 留在呼叫端（service），因為 service 還要在同一個
+  transaction 裡呼叫 `trash.js`。
+- `services/trash.js` 的 `addToTrash()` 被拆成 `insertTrashRow()`（純寫入，不 broadcast）+
+  `addToTrash()`（`insertTrashRow` + broadcast，給所有其他既有呼叫端維持原行為不變）。Wave 3B 的
+  delete 流程一律呼叫 `insertTrashRow`，broadcast 延後到 transaction commit 之後才由 route 觸發，
+  避免「transaction 中途 rollback，但 broadcast 已經先發出去通知前端東西被刪了」的不一致。
 
 ## Create Invoice
 
 ```text
 Use case: POST /api/schools/:schoolId/invoices
-File: server/src/routes/invoices.js
+Service:  server/src/services/finance.js — createInvoice()
 ```
 
-**Writes（順序）**：
-1. `INSERT INTO invoices`
-2. loop：`INSERT INTO invoice_items`（每個 session 一筆）
+**Wave 3A 記錄的風險**：items 迴圈中途失敗（例如某堂課被別的請求搶先開立、撞上
+`invoice_items.session_id` 的 `UNIQUE` constraint）會留下「invoice 存在但 items 不完整」的孤兒繳費單。
 
-**目前 transaction boundary**：無。每個 `db.prepare(...).run(...)` 各自 autocommit。
+**Transaction owner**：`services/finance.js` 的 `createInvoice()`。
 
-**Failure risks**：
-- Invoice 建立成功，但 items 迴圈中途失敗（例如某個 session 已被別的請求搶先開立、觸發 UNIQUE
-  constraint on `invoice_items.session_id`）→ 留下一張「有 invoice 但 items 不完整」的孤兒繳費單，
-  `total_amount` 會跟實際 items 加總對不上。
-- 高併發下兩個請求同時對同一堂課開立繳費單：目前用「先 SELECT 已開立過的 invoice_items 擋掉」
-  （route 裡 `SELECT 1 FROM invoice_items WHERE session_id = ?`）不是原子操作，理論上有 race window，
-  但實務上 `invoice_items.session_id` 有 `UNIQUE` constraint，真的撞上時第二個 INSERT 會直接失敗
-  （不會靜默造成重複收費，但會讓 invoice 本身已經建立、items 卻插入失敗，一樣是孤兒 invoice 的風險）。
+**Atomic writes**：先在 transaction **外**完成所有唯讀驗證（學生存在、逐堂課存在且屬於該學生、
+逐堂課尚未開立過），驗證全部通過才進入 `runInTransaction`，裡面只做兩件事：
+`financeRepository.insertInvoice()` + `financeRepository.insertInvoiceItems()`。
 
-**Ledger side effect**：無（開立繳費單當下不會自動產生 ledger_entries，要另外呼叫
-`POST /finance/generate-tuition` 才會產生對應收支明細，那是獨立的操作）。
+**Rollback guarantee**：`runInTransaction` 內任何一步拋出例外（包含唯一約束衝突、或測試用的強制
+失敗），SQLite 執行 `ROLLBACK`，`invoices` 與 `invoice_items` 兩張表都不會留下任何一行——已用失敗
+注入測試驗證（見下方 Failure Injection）。
 
-**Audit side effect**：Wave 3A 已加（`invoice.create`，見 `routes/invoices.js`）。
+**Failure injection 測試**：
+- Failure A（驗證期失敗）：session_ids 內混入不存在的 session id → 拋出 400，**在進入 transaction
+  之前**就失敗，資料庫完全沒有變動。已測試通過。
+- Failure B（transaction 內強制失敗）：monkeypatch `financeRepository.insertInvoiceItems` 讓它拋出
+  例外，驗證 `invoices` 表也沒有留下已插入的那一行（確認 `insertInvoice` 的效果被完整 rollback）。
+  已測試通過。
+- 重複開立（`invoice_items.session_id` UNIQUE）→ 409，驗證前的唯讀檢查（`hasInvoiceItemForSession`）
+  已經先擋下，不會進入 transaction。已測試通過。
 
-**Delete/Restore**：見下方「Delete Invoice」。
+**Ledger side effect**：無變化（跟 Wave 3A 記錄的一樣，開立當下不產生 ledger_entries）。
 
-**Concurrency risk**：中（同一堂課被搶先開立時，UNIQUE constraint 會擋下第二次寫入，但第一步的
-invoice row 已經建立，需要應用層清理或 Wave 3B 用 transaction 包起來自動 rollback）。
+**Audit side effect**：`invoice.create` 只在 `createInvoice()` 正常 return（即 transaction 已
+commit）之後、route 裡才呼叫 `logEvent`；任何 `FinanceError`（400/404/409）或非預期例外都會在
+`logEvent` 之前就 return/throw，不會出現「操作失敗但寫了成功的 audit log」。
+
+**Remaining concurrency risk**：低。原本「中」的風險（invoice 建立成功但 items 插入失敗留下孤兒）
+已經被 transaction 消除；剩下的唯一併發場景（兩個請求同時對同一堂課開立）仍然依賴
+`invoice_items.session_id` 的 `UNIQUE` constraint 作最後防線——第二個請求的 transaction 會在
+`insertInvoiceItems` 內失敗並完整 rollback（不會留下孤兒 invoice），跟 Wave 3A 記錄的「有 UNIQUE
+擋著、但沒有 atomicity 保證」的風險相比，現在有了 atomicity 保證，殘餘風險只是「第二個請求會拿到
+500 而不是預期的 409」（因為 UNIQUE 撞到的是 raw SQLite constraint error，不是應用層預先檢查出的
+`FinanceError(409)`）——這個 race window 極窄（兩個請求的驗證讀取剛好都通過、寫入才撞上），
+留給 Wave 4 視情況決定是否要把 SQLite constraint error 轉譯成 409。
 
 ---
 
@@ -43,29 +73,33 @@ invoice row 已經建立，需要應用層清理或 Wave 3B 用 transaction 包�
 
 ```text
 Use case: DELETE /api/schools/:schoolId/invoices/:id
-File: server/src/routes/invoices.js
+Service:  server/src/services/finance.js — deleteInvoice()
 ```
 
-**Writes（順序）**：
-1. `addToTrash(...)`（讀取 invoice + invoice_items + 相關 ledger_entries，寫進 `trash` 表 —— 這一步
-   必須在下面兩個 DELETE **之前**執行，否則 capture 會讀到已經被刪除的資料，這個順序目前是對的）
-2. `DELETE FROM ledger_entries WHERE related_invoice_id = ?`
-3. `DELETE FROM invoices WHERE id = ?`（`invoice_items` 靠 `ON DELETE CASCADE` 外鍵自動清除，
-   不需要應用層額外 DELETE）
+**Wave 3A 記錄的風險**：ledger_entries 刪除成功、invoices 刪除失敗，會留下「繳費單看似完好但收支
+明細已消失」的不一致狀態。
 
-**目前 transaction boundary**：無。
+**Transaction owner**：`services/finance.js` 的 `deleteInvoice()`。
 
-**Failure risks**：
-- Step 2 成功、step 3 失敗：ledger_entries 已刪但 invoice 還在，畫面上會看到「這張繳費單看似完好，
-  但收支明細已經消失」的不一致狀態。
-- trash capture（step 1）本身如果失敗（例如序列化錯誤），目前會直接拋出例外中斷整個請求，
-  不會執行到後面的 DELETE，這種情況下沒有不一致風險，但使用者會看到 500 且完全刪不掉。
+**Atomic writes**：`findInvoiceById`（404 檢查）與 `captureInvoice`（trash snapshot 讀取）都在
+transaction **外**完成（純讀取，不影響 atomicity）；`runInTransaction` 內依序：
+`insertTrashRow()` → `deleteInvoiceLedgerEntries()` → `deleteInvoiceRow()`（`invoice_items` 靠
+`ON DELETE CASCADE` 自動清除，不需要應用層額外 DELETE）。
 
-**Restore behavior**：`trash.js` 的 restore handler 目前**沒有**專門處理 `invoice` 類型的還原邏輯
-（只確認過 `session_cancelled`/`schedule_template` 有對應 handler，`invoice`/`payslip`/`ledger_entry`
-的還原邏輯屬於 Wave 4 cross-cutting 範圍，Wave 3A 沒有進一步查證，留待 Wave 4 一併確認）。
+**Rollback guarantee**：三步驟中任何一步失敗都會完整 rollback——已用失敗注入測試驗證：
+monkeypatch `financeRepository.deleteInvoiceRow` 讓它拋出例外，驗證 `trash` 表沒有多出那一筆（也就是
+`insertTrashRow` 的效果被回滾）、`invoices`/`ledger_entries` 都還在原狀。
 
-**Concurrency risk**：低（刪除操作本身沒有明顯的併發競爭場景）。
+**Ledger/trash broadcast 順序**：`insertTrashRow`（transaction 內）不 broadcast；transaction commit
+成功之後，route 才依序 `broadcastChange('trash')` + `broadcastChange('finance')`，確保前端收到的
+「東西被刪了」通知一定對應一個已經真正發生的刪除。
+
+**Audit side effect**：`invoice.delete` 只在 transaction commit 成功後才 log，同上一節的保證。
+
+**Remaining concurrency risk**：低（刪除操作本身沒有明顯的併發競爭場景，跟 Wave 3A 記錄的一致）。
+
+**Restore behavior**：`trash.js` 的 restore handler 目前仍**沒有**專門處理 `invoice` 類型的還原邏輯
+（沿用 Wave 3A 的記錄，屬於 Wave 4 cross-cutting 範圍，Wave 3B 沒有變動這部分）。
 
 ---
 
@@ -73,27 +107,30 @@ File: server/src/routes/invoices.js
 
 ```text
 Use case: POST /api/schools/:schoolId/payslips
-File: server/src/routes/payslips.js
+Service:  server/src/services/finance.js — createPayslip()
 ```
 
-**Writes（順序）**：
-1. `INSERT INTO payslips`
-2. loop：`INSERT INTO payslip_items`（每個 session 一筆）
+**Wave 3A 記錄的風險**：與 Create Invoice 完全對稱——items 迴圈中途失敗留下孤兒 payslip。
 
-**目前 transaction boundary**：無。
+**Transaction owner**：`services/finance.js` 的 `createPayslip()`。
 
-**Failure risks**：與 Create Invoice 完全對稱——payslip 建立成功但 items 中途失敗會留下孤兒
-payslip；`payslip_items.session_id` 同樣有 `UNIQUE` constraint 防止重複計薪，但不保證 atomicity。
+**Atomic writes**：所有業務規則驗證（課堂存在且屬於該教師、尚未開立過、「未來日期不可開薪資」、
+已請假/調課、尚未點名）都在 transaction 外完成；`runInTransaction` 內只做
+`financeRepository.insertPayslip()` + `financeRepository.insertPayslipItems()`。
 
-**額外業務規則（跟 Invoice 不同的地方）**：建立前會逐堂課檢查「是否已在未來」「是否已請假/調課」
-「是否尚未點名」，這些檢查本身是唯讀，不影響 atomicity 分析，但代表 Wave 3B 設計 transaction 時
-如果要在寫入前重新驗證，必須把這些規則也一併考慮進去（例如寫入過程中課堂被別的請求同時改成請假）。
+**Rollback guarantee**：與 Create Invoice 相同分析，已用失敗注入測試（monkeypatch
+`insertPayslipItems` 強制拋出例外）驗證 `payslips` 表沒有殘留孤兒行。
 
-**Ledger side effect**：無（跟 invoice 一樣，靠 `POST /finance/generate-salary` 另外產生）。
+**業務規則保留驗證（Wave 3B 明確要求）**：「未來日期不可開薪資」規則的錯誤訊息與 status code
+（`400`，訊息 `${session_date} ${subject} 尚未發生，無法開立薪資`）逐字保留，已用 regression 測試
+比對字串完全一致；「已請假/已調課」「尚未點名」的錯誤訊息與 400 status 同樣逐字保留。
 
-**Audit side effect**：Wave 3A 已加（`payslip.create`）。
+**Ledger side effect**：無變化（跟 invoice 一樣，靠 `POST /finance/generate-salary` 另外產生）。
 
-**Concurrency risk**：中（同 Create Invoice）。
+**Audit side effect**：`payslip.create` 只在 transaction commit 成功後才 log，同 Create Invoice。
+
+**Remaining concurrency risk**：低，分析與 Create Invoice 對稱（UNIQUE constraint 撞擊時會拿到 500
+而非預先檢查出的 409，同樣是極窄的 race window，留給 Wave 4）。
 
 ---
 
@@ -101,19 +138,23 @@ payslip；`payslip_items.session_id` 同樣有 `UNIQUE` constraint 防止重複�
 
 ```text
 Use case: DELETE /api/schools/:schoolId/payslips/:id
-File: server/src/routes/payslips.js
+Service:  server/src/services/finance.js — deletePayslip()
 ```
 
-**Writes（順序）**：與 Delete Invoice 完全對稱：
-1. `addToTrash(...)`（讀取 payslip + payslip_items + 相關 ledger_entries）
-2. `DELETE FROM ledger_entries WHERE related_payslip_id = ?`
-3. `DELETE FROM payslips WHERE id = ?`（`payslip_items` 靠 CASCADE 清除）
+**Transaction owner / Atomic writes / Rollback guarantee**：與 Delete Invoice 完全對稱（
+`insertTrashRow()` → `deletePayslipLedgerEntries()` → `deletePayslipRow()`，`payslip_items` 靠
+CASCADE 清除），已用相同方式的失敗注入測試驗證（monkeypatch `deletePayslipRow`）。
 
-**Failure risks / Restore behavior / Concurrency risk**：與 Delete Invoice 相同分析。
+**Audit / broadcast 順序**：與 Delete Invoice 相同——trash 寫入不在 transaction 內 broadcast，
+commit 成功後才 broadcast + log。
+
+**Remaining concurrency risk**：低。
+
+**Restore behavior**：沿用 Wave 3A 記錄，`payslip` 類型還原邏輯留給 Wave 4。
 
 ---
 
-## Generate Monthly Tuition / Salary（Wave 3A 範圍內，非 3B）
+## Generate Monthly Tuition / Salary（Wave 3A 分析，Wave 3B 未變動）
 
 ```text
 Use case: POST /api/schools/:schoolId/finance/generate-tuition
@@ -121,33 +162,24 @@ Use case: POST /api/schools/:schoolId/finance/generate-tuition
 File: server/src/routes/finance.js
 ```
 
-這兩個**不**列入 Wave 3B 待處理清單，原因：迴圈裡每一輪只寫**一張表**（`ledger_entries`，
-insert-or-update 二選一），不像 invoice/payslip 的 create 需要同時對兩張表原子寫入。單一
-ledger_entries 的 insert/update 本身就是一個 SQL statement，SQLite 保證單一 statement 的 atomicity，
-不需要額外包 transaction。
-
-**Failure risks**：迴圈中某一輪（某張 invoice/payslip）寫入失敗會中斷整個迴圈，但已經成功的前幾輪
-不會被回滾——最壞情況是「一部分 invoice/payslip 已經產生對應 ledger_entries，其餘沒有」，這是可以
-安全重跑的狀態（重新呼叫這個 endpoint，已經有 ledger_entries 的會走 update 分支，沒有的會補上），
-不會造成資料損毀或重複入帳（`related_invoice_id`/`related_payslip_id` 各自最多一筆的假設由呼叫端邏輯
-維持，沒有 DB 層 UNIQUE constraint 強制，但目前查詢邏輯是先查後寫，維持這個不變量）。
-
-**Duplicate risk**：低（先查 `findLedgerEntryByPayslip`/`findLedgerEntryByInvoice` 再決定 update 或
-insert，不會重複建立）。
+不在 Wave 3B 範圍內，原因與 Wave 3A 記錄相同：迴圈裡每一輪只寫一張表（`ledger_entries`，
+insert-or-update 二選一），單一 SQL statement 本身就有 SQLite 保證的 atomicity，不需要額外
+transaction；迴圈中途失敗只會留下「部分月份已產生 ledger_entries、其餘沒有」，可安全重跑補齊，
+不會造成資料損毀或重複入帳。Wave 3B 沒有變動這兩個 endpoint。
 
 ---
 
-## Wave 3B 待處理摘要
+## Wave 3B 完成摘要
 
-| Use case | Tables | Atomicity gap | 優先度 |
-|---|---|---|---|
-| Create Invoice | invoices + invoice_items | 中：items 迴圈中途失敗留孤兒 invoice | 高 |
-| Delete Invoice | ledger_entries + invoices | 低：目前執行順序正確，只差沒有整體 rollback 保證 | 中 |
-| Create Payslip | payslips + payslip_items | 中：同 Create Invoice | 高 |
-| Delete Payslip | ledger_entries + payslips | 低：同 Delete Invoice | 中 |
+| Use case | Transaction owner | Atomic writes | Rollback 驗證 | Audit 時機 | 殘餘風險 |
+|---|---|---|---|---|---|
+| Create Invoice | `financeService.createInvoice` | insertInvoice + insertInvoiceItems | ✅ 失敗注入測試通過 | 僅 commit 後 | 低（UNIQUE race 會變 500 而非 409） |
+| Delete Invoice | `financeService.deleteInvoice` | insertTrashRow + deleteLedger + deleteInvoiceRow | ✅ 失敗注入測試通過 | 僅 commit 後 | 低 |
+| Create Payslip | `financeService.createPayslip` | insertPayslip + insertPayslipItems | ✅ 失敗注入測試通過 | 僅 commit 後 | 低（同 Create Invoice） |
+| Delete Payslip | `financeService.deletePayslip` | insertTrashRow + deleteLedger + deletePayslipRow | ✅ 失敗注入測試通過 | 僅 commit 後 | 低 |
 
-Wave 3B 建議做法（先記錄方向，不在 Wave 3A 實作）：仿照 Wave 2 的
-`schedulingRepository.createTemplate`/`updateTemplate` 模式，把「建立 invoice + items」「刪除
-invoice 的 ledger + invoice 本身」各自包成 `financeRepository` 裡自帶 `runInTransaction` 的單一方法，
-route 只呼叫一次；「刪除」流程要特別注意 trash capture 必須在真正 DELETE 之前完成（跟 Wave 2 處理
-`schedule_template` 刪除時踩過的坑一樣，見 `docs/REPOSITORY_ARCHITECTURE.md`）。
+**測試方式**：全部針對 `DATABASE_PATH` 指向的隔離 SQLite 檔案執行（種子建立 school/user/student/
+teacher/session 等最小資料），涵蓋 happy path、驗證期失敗（不進入 transaction）、transaction 內
+強制失敗（monkeypatch repository 方法拋出例外）、重複開立/請假/未來日期等既有業務規則、
+`PRAGMA foreign_key_check`、孤兒 row 檢查、跨 process 重啟後資料持久性驗證，共 19 項全數通過，
+未使用正式的 `server/data/app.db` 或 Docker named volume。

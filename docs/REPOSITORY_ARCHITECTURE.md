@@ -66,10 +66,13 @@ import { studentsRepository } from '../repositories/index.js';
 
 ## Transaction Boundary
 
-目前沿用 `db/index.js` 既有的 `runInTransaction(fn)`（同步 `BEGIN`/`COMMIT`/`ROLLBACK`）。Wave 1 涉及的
-domain（students/teachers/schools/memberships）沒有需要跨 repository atomic 的 use case，尚未引入額外的
-transaction abstraction。Wave 3（finance：invoice + items + ledger）預期會需要，屆時再設計最小的
-`transactionManager`/`withTransaction` 包裝，不在 Phase 1B 提前 overengineer。
+目前沿用 `db/index.js` 既有的 `runInTransaction(fn)`（同步 `BEGIN`/`COMMIT`/`ROLLBACK`，`node:sqlite`
+的 `DatabaseSync` 沒有 `better-sqlite3` 那種 `db.transaction()` helper，手動包一層）。Wave 1 涉及的
+domain（students/teachers/schools/memberships）沒有需要跨 repository atomic 的 use case，沒有引入額外
+抽象。Wave 3B（finance：invoice/payslip create + delete）是第一個真正需要「transaction 內橫跨
+repository 之外的 service（`trash.js`）」的 use case，見下方「Finance Transaction Boundary（Wave
+3B）」——驗證後的結論是：**不需要**額外的 `transactionManager`/`withTransaction` 包裝，`runInTransaction`
+搭配「transaction ownership 上移到 service 層」就足以覆蓋這個需求，維持不 overengineer 的原則。
 
 ## 為什麼不做 Generic Repository
 
@@ -79,16 +82,18 @@ transaction abstraction。Wave 3（finance：invoice + items + ledger）預期�
 2. PostgreSQL 的語意（例如 `RETURNING`、async client）跟 SQLite 不同，generic CRUD 包裝反而會把
    底層差異隱性洩漏到呼叫端，Phase 1C 遷移時更難處理。
 
-## 現況（Wave 3A 完成後）
+## 現況（Wave 3B 完成後）
 
 已完成 repository 化：`students`、`teachers`、`schools`、`memberships`、`users`（Wave 1），
 `scheduling`（`schedule_templates`/`template_students`/`class_sessions`/`session_students`）、
 `attendance`、`seats`（Wave 2），`auditLogs`（Wave 2.1），`finance`（`ledger_entries`、
-`tuition_records` 完整 CRUD；`invoices`/`payslips` 唯讀，Wave 3A）。
+`tuition_records` 完整 CRUD；`invoices`/`payslips` 唯讀 + Wave 3B 補上的細粒度 write 方法）。
 
-尚未完成（見 `docs/PERSISTENCE_INVENTORY.md`）：finance 的 invoice/payslip 建立與刪除（跨表 atomic
-transaction，Wave 3B，詳見 `docs/FINANCE_TRANSACTION_INVENTORY.md`）、cross-cutting
-（`auth`/`inviteCodes`/`notes`/`trash`，Wave 4）。
+`routes/invoices.js`、`routes/payslips.js` 在 Wave 3B 之後**完全不含**直接 SQL，POST/DELETE 都改呼叫
+`services/finance.js` 的 transaction-owning function。
+
+尚未完成（見 `docs/PERSISTENCE_INVENTORY.md`）：cross-cutting（`auth`/`inviteCodes`/`notes`/`trash`，
+Wave 4）。
 
 ## Finance Repository（Wave 3A）
 
@@ -99,12 +104,45 @@ transaction，Wave 3B，詳見 `docs/FINANCE_TRANSACTION_INVENTORY.md`）、cros
 
 ### Finance Read Boundary
 
-Wave 3A 只處理**讀取查詢**（列表、明細、彙總）與**低風險單表 CRUD**（`ledger_entries`、
+Wave 3A 處理了**讀取查詢**（列表、明細、彙總）與**低風險單表 CRUD**（`ledger_entries`、
 `tuition_records`，兩者都是單一資料表的寫入，沒有跨表 atomicity 疑慮）。`invoices`/`payslips` 的
 建立與刪除因為橫跨兩張表（`invoices`+`invoice_items`、`payslips`+`payslip_items`，刪除還牽涉
-`ledger_entries`），刻意留給 Wave 3B，`routes/invoices.js`、`routes/payslips.js` 的 POST/DELETE
-目前仍直接 `import { db }`——這是**唯一**允許在 Wave 3A 之後的 application-layer 直接 SQL 例外，
-每一處都在檔案裡用註解標明「NOTE（Wave 3A）」並指向 `docs/FINANCE_TRANSACTION_INVENTORY.md`。
+`ledger_entries`），Wave 3A 當時刻意留給 Wave 3B。
+
+### Finance Transaction Boundary（Wave 3B）
+
+Wave 3B 補上了 invoice/payslip 的建立與刪除，**transaction ownership 明確歸屬 Application/Service
+層**，不是 Route、也不是 Repository：
+
+```text
+Route (invoices.js / payslips.js)
+  -> HTTP request 解析 + FinanceError -> status code 轉換，不寫任何 SQL
+Service (finance.js)
+  -> createInvoice / deleteInvoice / createPayslip / deletePayslip
+  -> 業務驗證（transaction 外，純讀取）
+  -> runInTransaction(() => { 呼叫多個細粒度 repository 方法 + trash.insertTrashRow })
+  -> 回傳結果給 route 做 broadcast/audit log
+Repository (finance.repository.js)
+  -> insertInvoice / insertInvoiceItems / deleteInvoiceLedgerEntries / deleteInvoiceRow（及 payslip 對應方法）
+  -> 每個方法只做一件事、一個 SQL statement，不知道「一次開立繳費單」的完整流程，也不自帶 runInTransaction
+```
+
+`financeRepository` 之所以不像 Wave 2 的 `scheduling.repository.js`（`createTemplate` 等方法會自己
+包 `runInTransaction`）讓寫入方法自帶 transaction，是因為這幾個 finance use case 的 transaction
+需要延伸到 `financeRepository` 之外——`services/trash.js` 的 `insertTrashRow`（刪除流程的 trash
+capture）。如果讓 repository 自己包 transaction，service 就無法把 trash 寫入納入同一個
+transaction，delete 流程就會退回 Wave 3A 記錄的「trash 寫成功、但後面的 DELETE 失敗」不一致風險。
+因此這個 Wave 明確把 ownership 上移一層：repository 只負責細粒度、可組合的單一操作，service 負責
+組合並圈定 transaction 邊界。
+
+`services/trash.js` 的 `addToTrash()` 也因此被拆成 `insertTrashRow()`（純寫入，不 broadcast，給
+transaction 內部用）+ `addToTrash()`（`insertTrashRow` + `broadcastChange`，維持所有既有呼叫端不變）
+——這個拆分本身不是 Wave 3B 的核心交付，但是啟用「trash 寫入可以安全放進 finance 的 transaction」
+的必要前置修正（原本的 `addToTrash` 會在自己的 INSERT 之後立刻 broadcast，如果被包進一個可能
+rollback 的 transaction，會出現「broadcast 已發出但資料其實被回滾」的競態）。
+
+實際的 transaction 內容、rollback 保證、失敗注入測試結果，見
+`docs/FINANCE_TRANSACTION_INVENTORY.md`。
 
 ### Finance Calculation Ownership
 
@@ -124,9 +162,13 @@ repository——repository 只負責回傳 `rate`、`hours`、`records`、`items
 Wave 3A 已對 Finance 內實際處理的 mutation 加 log（ledger create/update/delete/generate-salary/
 generate-tuition、invoice.create/delete、payslip.create/delete、tuition_record.upsert/delete）。
 Metadata 只記必要資訊（`item_count`、`total`、`created`/`updated` 筆數），不記錄完整
-invoice/payslip/学生財務檔案物件，遵守 Wave 2.1 建立的 sensitive-data sanitizer 政策。Wave 3B
-的 invoice/payslip create/delete 目前用的還是 Wave 3A 加上去的 log 呼叫，沒有因為 transaction
-還沒重構就跳過 audit。
+invoice/payslip/学生財務檔案物件，遵守 Wave 2.1 建立的 sensitive-data sanitizer 政策。
+
+Wave 3B 進一步收緊了 invoice/payslip create/delete 這四個 log 呼叫的**時機保證**：route 現在的控制流
+是「呼叫 service → 如果拋出 `FinanceError` 就立刻 return 錯誤 response，不執行後面任何程式碼 →
+只有 service 正常 return（代表 transaction 已經 commit）才會走到 `logEvent(...)`」。這個順序本身就是
+一種結構性保證——不需要額外的「先寫 log 再檢查是否成功」防呆，因為 log 呼叫在程式碼位置上就位於
+transaction 成功完成之後，rollback 的路徑（例外拋出）不可能到達 log 呼叫。
 
 ## AuditLog Service / Repository（Wave 2.1）
 

@@ -1,4 +1,132 @@
-import { financeRepository, teachersRepository, studentsRepository, schedulingRepository } from '../repositories/index.js';
+import { nanoid } from 'nanoid';
+import { financeRepository, teachersRepository, studentsRepository, schedulingRepository, runInTransaction } from '../repositories/index.js';
+import { insertTrashRow, captureInvoice, capturePayslip } from './trash.js';
+
+// 業務錯誤（缺欄位/找不到/重複開立）用這個攜帶 HTTP status，route 抓到後照原本的狀態碼回應，
+// 不會因為改成 Service + transaction 架構就把這些「預期內的業務錯誤」全部變成 500。
+export class FinanceError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+// ---------- Wave 3B：Invoice / Payslip 的 create / delete，transaction ownership 在這一層 ----------
+//
+// Route 只負責：HTTP request -> 呼叫這裡 -> 把 FinanceError 轉回原本的 status code。
+// Repository 只提供細粒度的單一 SQL 操作，不知道「一次開立繳費單」這個完整流程長怎樣。
+// 這裡負責組合驗證 + runInTransaction 內的多筆寫入，確保 all-or-nothing。
+
+export function createInvoice(schoolId, { studentId, sessionIds, note }) {
+  if (!studentId || !Array.isArray(sessionIds) || sessionIds.length === 0) {
+    throw new FinanceError(400, 'student_id and session_ids required');
+  }
+
+  const student = studentsRepository.findById(schoolId, studentId);
+  if (!student) throw new FinanceError(404, 'student not found');
+
+  const items = [];
+  for (const sessionId of sessionIds) {
+    const row = financeRepository.findInvoiceableSessionRow(schoolId, studentId, sessionId);
+    if (!row) throw new FinanceError(400, `課堂不存在或不屬於此學生（${sessionId}）`);
+    if (financeRepository.hasInvoiceItemForSession(sessionId)) {
+      throw new FinanceError(409, `${row.session_date} ${row.subject} 已開立過繳費單，無法重複開立`);
+    }
+    items.push(row);
+  }
+
+  const total = items.reduce((sum, i) => sum + i.unit_price, 0);
+  const invoiceId = nanoid();
+
+  runInTransaction(() => {
+    financeRepository.insertInvoice({ id: invoiceId, schoolId, studentId, totalAmount: total, note: note || null });
+    financeRepository.insertInvoiceItems(
+      invoiceId,
+      items.map((i) => ({ id: nanoid(), sessionId: i.id, unitPrice: i.unit_price }))
+    );
+  });
+
+  return { invoiceId, itemCount: items.length, total, studentName: student.name };
+}
+
+export function deleteInvoice(schoolId, invoiceId, userId) {
+  const invoice = financeRepository.findInvoiceById(schoolId, invoiceId);
+  if (!invoice) throw new FinanceError(404, 'not found');
+
+  const student = studentsRepository.findById(schoolId, invoice.student_id);
+  const label = `${student?.name || '未知學生'} ${invoice.issued_date} 繳費單`;
+  const snapshot = captureInvoice(invoiceId);
+
+  runInTransaction(() => {
+    insertTrashRow(schoolId, 'invoice', label, snapshot, userId, { studentIds: [invoice.student_id] });
+    financeRepository.deleteInvoiceLedgerEntries(invoiceId);
+    financeRepository.deleteInvoiceRow(schoolId, invoiceId);
+  });
+
+  return { label };
+}
+
+export function createPayslip(schoolId, { teacherId, sessionIds, note }) {
+  if (!teacherId || !Array.isArray(sessionIds) || sessionIds.length === 0) {
+    throw new FinanceError(400, 'teacher_id and session_ids required');
+  }
+
+  const teacher = teachersRepository.findById(schoolId, teacherId);
+  if (!teacher) throw new FinanceError(404, 'teacher not found');
+
+  const today = financeRepository.today();
+
+  const items = [];
+  for (const sessionId of sessionIds) {
+    const session = financeRepository.findPayslipableSessionRow(schoolId, teacherId, sessionId);
+    if (!session) throw new FinanceError(400, `課堂不存在或不屬於此教師（${sessionId}）`);
+    if (financeRepository.hasPayslipItemForSession(sessionId)) {
+      throw new FinanceError(409, `${session.session_date} ${session.subject} 已開立過薪資條，無法重複開立`);
+    }
+    if (session.session_date > today) {
+      throw new FinanceError(400, `${session.session_date} ${session.subject} 尚未發生，無法開立薪資`);
+    }
+    const item = calcSessionPay(teacher, session);
+    if (item.fully_on_leave) {
+      const label = item.leave_is_makeup ? '已調課' : '已請假';
+      throw new FinanceError(400, `${session.session_date} ${session.subject}（${label}）無法計入薪資`);
+    }
+    if (item.not_yet_marked) {
+      throw new FinanceError(400, `${session.session_date} ${session.subject} 尚未點名，無法開立薪資`);
+    }
+    items.push(item);
+  }
+
+  const total = items.reduce((sum, i) => sum + i.pay, 0);
+  const payslipId = nanoid();
+
+  runInTransaction(() => {
+    financeRepository.insertPayslip({ id: payslipId, schoolId, teacherId, totalAmount: Math.round(total), note: note || null });
+    financeRepository.insertPayslipItems(
+      payslipId,
+      items.map((i) => ({ id: nanoid(), sessionId: i.session_id, hours: i.hours, rate: i.rate, pay: Math.round(i.pay) }))
+    );
+  });
+
+  return { payslipId, itemCount: items.length, teacherName: teacher.name };
+}
+
+export function deletePayslip(schoolId, payslipId, userId) {
+  const payslip = financeRepository.findPayslipById(schoolId, payslipId);
+  if (!payslip) throw new FinanceError(404, 'not found');
+
+  const teacher = teachersRepository.findById(schoolId, payslip.teacher_id);
+  const label = `${teacher?.name || '未知教師'} ${payslip.issued_date} 薪資條`;
+  const snapshot = capturePayslip(payslipId);
+
+  runInTransaction(() => {
+    insertTrashRow(schoolId, 'payslip', label, snapshot, userId, { teacherId: payslip.teacher_id });
+    financeRepository.deletePayslipLedgerEntries(payslipId);
+    financeRepository.deletePayslipRow(schoolId, payslipId);
+  });
+
+  return { label };
+}
 
 export function monthRange(month) {
   // month: 'YYYY-MM' -> [第一天, 下個月第一天)

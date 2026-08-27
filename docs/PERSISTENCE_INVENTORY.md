@@ -29,7 +29,7 @@ Phase 0 建立時是純盤點；Phase 1B 開始逐步把直接 SQL 存取收斂�
 | `attendance.repository.js` | `attendance_records` | 2 |
 | `seats.repository.js` | `seat_assignments`, `seat_students` | 2 |
 | `auditLogs.repository.js` | `audit_logs`（cross-cutting infra，不屬於任何 business domain） | 2.1 |
-| `finance.repository.js` | `ledger_entries`, `invoices`/`invoice_items`（唯讀）, `payslips`/`payslip_items`（唯讀）, `tuition_records` | 3A |
+| `finance.repository.js` | `ledger_entries`, `invoices`/`invoice_items`, `payslips`/`payslip_items`, `tuition_records`（Wave 3A 唯讀 + Wave 3B 補上細粒度 write 方法） | 3A / 3B |
 
 ## 統計方式說明（Wave 2.1 起）
 
@@ -37,25 +37,32 @@ Phase 1B 的 KPI 是 **application-layer（routes/services/auth）的直接 SQL 
 本身的 SQL 數量（repository 裡的 SQL 是預期、合法存在的，不算「散落」）。
 
 ```text
-Application-layer direct SQL（routes + services + auth，扣掉 repositories/db）: 71
-Repository-layer SQL（10 個 repository 合計，都是預期合法存在）: 108
+Application-layer direct SQL（routes + services + auth，扣掉 repositories/db）: 46
+Repository-layer SQL（10 個 repository 合計，都是預期合法存在）: 118
 db/index.js（schema/migration infra）: 26
 ```
 
-## 直接存取 db 的檔案（Wave 3A 之後現況，application layer）
+（Wave 3B 起改用 `grep -c "db\.prepare\|db\.exec"` 逐檔精確計數，取代先前的估算數字；上一輪 Wave 3A
+記錄的 71 是估算值，跟這次的精確重新計算方式不完全一致，這裡改以精確計數為準，往後 Wave 沿用同一方式。）
+
+## 直接存取 db 的檔案（Wave 3B 之後現況，application layer）
 
 | 檔案 | 次數 | Domain / 備註 |
 |---|---:|---|
-| server/src/services/trash.js | 18 | Wave 4（cross-cutting） |
-| server/src/routes/notes.js | 17 | Wave 4（cross-cutting） |
-| server/src/routes/payslips.js | 10 | **Wave 3B（刻意保留）**：POST（create payslip+items）與 DELETE（payslip+ledger）是跨表寫入，見 `docs/FINANCE_TRANSACTION_INVENTORY.md`；GET 系列已在 Wave 3A 全部收斂進 repository |
-| server/src/routes/invoices.js | 9 | **Wave 3B（刻意保留）**：POST（create invoice+items）與 DELETE（invoice+ledger）同上；GET 系列已收斂 |
+| server/src/services/trash.js | 16 | Wave 4（cross-cutting） |
+| server/src/routes/notes.js | 15 | Wave 4（cross-cutting） |
 | server/src/routes/inviteCodes.js | 7 | Wave 4（cross-cutting，含 memberships insert，需與 memberships.repository 協調） |
 | server/src/routes/auth.js | 4 | Wave 4（cross-cutting，LINE Login upsert） |
 | server/src/routes/trash.js | 3 | Wave 4（cross-cutting） |
 | server/src/routes/dev.js | 1 | 開發用假登入輔助路由，Wave 4 可能整條淘汰 |
 
-共 7 個非 infra/repository 檔案、71 處直接 SQL 呼叫。
+共 6 個非 infra/repository 檔案、46 處直接 SQL 呼叫。
+
+`server/src/routes/invoices.js`、`server/src/routes/payslips.js` **在 Wave 3B 之後也已經沒有任何**
+直接 SQL——POST（create invoice/payslip + items）與 DELETE（invoice/payslip + ledger + trash）全部改由
+`services/finance.js` 的 `createInvoice`/`deleteInvoice`/`createPayslip`/`deletePayslip` 在單一
+`runInTransaction` 內組合呼叫 `financeRepository` 的細粒度 write 方法完成，見
+`docs/FINANCE_TRANSACTION_INVENTORY.md`。
 
 `server/src/services/finance.js`、`server/src/routes/students.js`、`server/src/routes/finance.js`
 **都已經沒有任何**直接 SQL——Wave 3A 完成前 `finance.js`（route）11 處、`students.js` 4 處直接 SQL
@@ -73,14 +80,22 @@ transaction orchestration 例外（Wave 2.1 已修正，非本 Wave 新增）。
 | Wave 1 | students / teachers / schools / memberships | 76 | 142 |
 | Wave 2 | scheduleTemplates / sessions / seats / attendance | 46 | 96 |
 | Wave 2.1 | Admin Mode + Audit Log infra + attendance transaction ownership 修正 | 2 | 94 |
-| Wave 3A | Finance read models + 低風險 CRUD（ledger、tuition_records）+ students.js/finance.js 殘留清理 | 23 | 71 |
-| Wave 3B（待進行） | Invoice/Payslip 跨表 atomic transaction | — | — |
+| Wave 3A | Finance read models + 低風險 CRUD（ledger、tuition_records）+ students.js/finance.js 殘留清理 | 23（估算） | 71（估算，見上方精確計數說明） |
+| Wave 3B | Invoice/Payslip 跨表 atomic transaction（POST/DELETE 兩個 route 全部改用 service transaction） | 19（精確計數） | 46 |
 | Wave 4（待進行） | auth / inviteCodes / notes / trash / dev | — | — |
 
 Wave 3A 移動明細：`services/finance.js`（全部計算邏輯改呼叫 repository）、`routes/finance.js`
 （ledger CRUD + summary + generate-salary/tuition，11 處全移）、`routes/students.js`
 （tuition_records CRUD + 殘留的 class_sessions 查詢，4 處全移）、`routes/invoices.js` 與
 `routes/payslips.js` 的 GET 系列（各自 2 處與 3 處，POST/DELETE 刻意保留給 Wave 3B）。
+
+Wave 3B 移動明細：`routes/invoices.js` 的 POST（9 處）與 `routes/payslips.js` 的 POST/DELETE
+（10 處）全部改由 `services/finance.js` 新增的 `createInvoice`/`deleteInvoice`/`createPayslip`/
+`deletePayslip` 取代，這四個 service function 各自用一個 `runInTransaction` 組合呼叫
+`financeRepository` 新增的細粒度 write 方法（`insertInvoice`/`insertInvoiceItems`/
+`deleteInvoiceLedgerEntries`/`deleteInvoiceRow` 及 payslip 對應方法）與 `trash.js` 新增的
+`insertTrashRow`（transaction-safe，不 broadcast）。兩個 route 檔案現在完全不含 `db.prepare`/
+`db.exec`，只呼叫 service + repository。
 
 ## 目標（Wave 4 完成後）
 

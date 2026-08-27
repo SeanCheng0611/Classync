@@ -186,13 +186,38 @@ technical debt，Wave 2/3 遇到類似狀況會依樣處理，最後統一評估
 - `invoice_items`/`payslip_items` 對 `invoices`/`payslips` 是 `ON DELETE CASCADE`，這個沒問題，
   PostgreSQL 語法相同。
 
-### Transaction Assumptions（Wave 3B 待處理，先記錄現況）
+### Transaction Assumptions（Wave 3B 已完成，記錄現況供 Phase 1C 參考）
 
-Invoice/Payslip 的建立與刪除目前**完全沒有** transaction 保護（見
-`docs/FINANCE_TRANSACTION_INVENTORY.md` 的詳細分析）。Phase 1C 遷移到 PostgreSQL 時，如果 Wave 3B
-還沒把這些操作包成 repository 自帶 transaction 的方法，遷移後的 async transaction（見本文件開頭
-「Transaction 語意」段落）**必須**同時解決這個問題，不能延續「沒有 transaction 保護」的現況——
-PostgreSQL 環境下網路延遲更容易放大「invoice 建立成功但 items 寫入中途失敗」的機率。
+Invoice/Payslip 的建立與刪除在 Wave 3B 已經有完整 transaction 保護（見
+`docs/FINANCE_TRANSACTION_INVENTORY.md`），但 ownership 位置對 Phase 1C 的 async 化有直接影響，
+記錄如下：
+
+- transaction ownership 在 **Service 層**（`services/finance.js`），不是 repository 方法自帶——
+  跟 Wave 2 開頭「Transaction 語意」段落記錄的「PostgreSQL 版本的 repository method 可能需要接收
+  `client`/`tx` 參數」規劃**完全吻合**：Wave 3B 的 `runInTransaction(() => { ...組合呼叫多個
+  repository 方法... })` 這個 pattern，換成 PostgreSQL 版本時，最自然的作法就是把 `runInTransaction`
+  改成 async、把借來的 pool client 透過某種 context 傳給 callback 內呼叫的每個 repository 方法。因為
+  Wave 3B 的 service function（`createInvoice`/`deleteInvoice`/`createPayslip`/`deletePayslip`）已經
+  把「呼叫哪些 repository 方法、順序為何」明確攤平寫在一個函式裡（不是藏在某個 repository 的
+  巨型方法內），Phase 1C 遷移時只需要改 `runInTransaction` 的實作與這些 repository 方法的簽名
+  （加上可選的 `client` 參數），呼叫端的邏輯結構不需要重寫。
+- `BEGIN`/`COMMIT`/`ROLLBACK` 映射：目前 `runInTransaction` 是同步呼叫 `db.exec('BEGIN')` /
+  `db.exec('COMMIT')` / `db.exec('ROLLBACK')`（`node:sqlite` 單一全域連線）。PostgreSQL 版本這三個
+  操作都要在**同一個借來的 pool client** 上執行（`client.query('BEGIN')` 等），且都是 async，
+  呼叫端全部要改成 `await`。Wave 3B 的四個 service function 目前是同步函式，遷移後會變成 async
+  函式，連帶 `routes/invoices.js`/`routes/payslips.js` 的 handler 也要改成 `async (req, res) => {...}`
+  並 `await` service 呼叫——這是 Phase 1C 的範圍，Wave 3B 沒有提前做。
+- Isolation level 考量：目前 SQLite 的 `BEGIN` 是預設的 deferred transaction，配合 Wave 3B 的作法
+  （先在 transaction 外做完所有唯讀驗證，transaction 內只做確定要寫入的操作），實際上把「檢查 -
+  寫入」的競態窗口壓縮到很小，但沒有消除（見 `FINANCE_TRANSACTION_INVENTORY.md` 的「Remaining
+  concurrency risk」）。PostgreSQL 預設 isolation level 是 `READ COMMITTED`，跟 SQLite 的行為不完全
+  對等；如果 Phase 1C 想徹底消除 Wave 3B 記錄的「UNIQUE constraint race 導致 500 而非 409」這個殘餘
+  風險，可以考慮把 create invoice/payslip 的 transaction 提升到 `SERIALIZABLE`（會增加重試邏輯的
+  複雜度）——這是留給 Phase 1C 決定是否值得做的取捨，Wave 3B 不做決定，只記錄現況與選項。
+- Rollback 語意本身（例外拋出 → 整個 transaction 內的寫入全部復原）在 SQLite 與 PostgreSQL 之間預期
+  一致，Wave 3B 的失敗注入測試方法論（monkeypatch repository 方法拋出例外、驗證資料庫行數沒有變化）
+  可以直接沿用到 Phase 1C 遷移後的 regression test，不需要重新設計測試策略，只需要把測試從同步呼叫
+  改成 `await`。
 
 ## 待補充（後續 Wave）
 
