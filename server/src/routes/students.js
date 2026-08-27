@@ -1,12 +1,15 @@
 import { Router } from 'express';
 import { nanoid } from 'nanoid';
 import { db } from '../db/index.js';
+import { studentsRepository } from '../repositories/index.js';
 import { requireMembership } from '../auth/middleware.js';
 import { broadcastChange } from '../realtime/index.js';
 import { ensureSessionsForRange } from '../services/sessions.js';
 import { calcStudentTuitionForMonth } from '../services/finance.js';
 import { addToTrash, captureStudent } from '../services/trash.js';
 import { sortStudents } from '../services/nameSort.js';
+import { logEvent } from '../services/auditLog.service.js';
+import { PAGE_KEYS } from '../constants/pageKeys.js';
 
 export const studentsRouter = Router({ mergeParams: true });
 studentsRouter.use(requireMembership());
@@ -20,17 +23,13 @@ function serialize(row) {
 studentsRouter.get('/', (req, res) => {
   const rows =
     req.membership.role !== 'teacher'
-      ? db.prepare('SELECT * FROM students WHERE school_id = ?').all(req.params.schoolId)
-      : db
-          .prepare('SELECT * FROM students WHERE school_id = ? AND teacher_id = ?')
-          .all(req.params.schoolId, req.membership.teacher_id || '');
+      ? studentsRepository.findAllBySchool(req.params.schoolId)
+      : studentsRepository.findAllBySchoolAndTeacher(req.params.schoolId, req.membership.teacher_id);
   res.json(sortStudents(rows).map(serialize));
 });
 
 studentsRouter.get('/:id', (req, res) => {
-  const row = db
-    .prepare('SELECT * FROM students WHERE school_id = ? AND id = ?')
-    .get(req.params.schoolId, req.params.id);
+  const row = studentsRepository.findById(req.params.schoolId, req.params.id);
   if (!row) return res.status(404).json({ error: 'not found' });
   if (req.membership.role === 'teacher' && row.teacher_id !== req.membership.teacher_id) {
     return res.status(403).json({ error: 'forbidden' });
@@ -39,10 +38,9 @@ studentsRouter.get('/:id', (req, res) => {
 });
 
 // 該學生在區間內的課堂與對應出缺勤狀態（詳細頁的課堂/出缺勤紀錄用）
+// 課堂/出缺勤查詢屬於 scheduling domain，留待該 Wave 再抽離 repository
 studentsRouter.get('/:id/sessions', (req, res) => {
-  const student = db
-    .prepare('SELECT * FROM students WHERE school_id = ? AND id = ?')
-    .get(req.params.schoolId, req.params.id);
+  const student = studentsRepository.findById(req.params.schoolId, req.params.id);
   if (!student) return res.status(404).json({ error: 'not found' });
   if (req.membership.role === 'teacher' && student.teacher_id !== req.membership.teacher_id) {
     return res.status(403).json({ error: 'forbidden' });
@@ -71,13 +69,12 @@ studentsRouter.get('/:id/sessions', (req, res) => {
 });
 
 // 該學生某月的應收/實收金額紀錄（財務資料，僅管理者）
+// tuition_records 查詢屬於 finance domain，留待該 Wave 再抽離 repository
 studentsRouter.get('/:id/tuition', requireMembership(['admin']), (req, res) => {
   const { month } = req.query;
   if (!month) return res.status(400).json({ error: 'month required (YYYY-MM)' });
 
-  const student = db
-    .prepare('SELECT * FROM students WHERE school_id = ? AND id = ?')
-    .get(req.params.schoolId, req.params.id);
+  const student = studentsRepository.findById(req.params.schoolId, req.params.id);
   if (!student) return res.status(404).json({ error: 'not found' });
 
   const calc = calcStudentTuitionForMonth(req.params.schoolId, req.params.id, month);
@@ -114,9 +111,7 @@ studentsRouter.put('/:id/tuition', requireMembership(['admin']), (req, res) => {
   const { month, session_count, unit_price, actual_amount, rollover, note } = req.body;
   if (!month) return res.status(400).json({ error: 'month required (YYYY-MM)' });
 
-  const student = db
-    .prepare('SELECT * FROM students WHERE school_id = ? AND id = ?')
-    .get(req.params.schoolId, req.params.id);
+  const student = studentsRepository.findById(req.params.schoolId, req.params.id);
   if (!student) return res.status(404).json({ error: 'not found' });
 
   const calc = calcStudentTuitionForMonth(req.params.schoolId, req.params.id, month);
@@ -164,7 +159,7 @@ studentsRouter.delete('/:id/tuition', requireMembership(['admin']), (req, res) =
     .prepare('SELECT * FROM tuition_records WHERE school_id = ? AND student_id = ? AND month = ?')
     .get(req.params.schoolId, req.params.id, month);
   if (existing) {
-    const student = db.prepare('SELECT name FROM students WHERE id = ?').get(req.params.id);
+    const student = studentsRepository.findById(req.params.schoolId, req.params.id);
     addToTrash(
       req.params.schoolId,
       'tuition_record',
@@ -190,33 +185,32 @@ studentsRouter.post('/', requireMembership(['admin', 'front_desk']), (req, res) 
   if (!name || !grade) return res.status(400).json({ error: 'name and grade required' });
 
   // 姓名重複不擋，只在回傳結果中提醒（前端匯入/新增流程改成在送出前先跳視窗詢問，這裡只當保險）
-  const dupName = db.prepare('SELECT id FROM students WHERE school_id = ? AND name = ?').get(req.params.schoolId, name);
+  const dupName = studentsRepository.findByName(req.params.schoolId, name);
 
   const id = nanoid();
-  db.prepare(
-    `INSERT INTO students (id, school_id, name, grade, school_name, subjects, teacher_id, tuition_monthly, note, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
+  studentsRepository.create({
     id,
-    req.params.schoolId,
+    schoolId: req.params.schoolId,
     name,
     grade,
-    school_name || null,
-    JSON.stringify(subjects || []),
-    teacher_id || null,
-    tuition_monthly || 0,
-    note || null,
-    status === 'inactive' ? 'inactive' : 'active'
-  );
+    schoolName: school_name || null,
+    subjects: subjects || [],
+    teacherId: teacher_id || null,
+    tuitionMonthly: tuition_monthly || 0,
+    note: note || null,
+    status: status === 'inactive' ? 'inactive' : 'active',
+  });
 
   broadcastChange(req.params.schoolId, 'students');
-  res.status(201).json({ ...serialize(db.prepare('SELECT * FROM students WHERE id = ?').get(id)), duplicate_name: !!dupName });
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.STUDENTS, action: 'student.create',
+    message: `新增學生「${name}」`, userId: req.user.id, schoolId: req.params.schoolId, entityType: 'student', entityId: id,
+  });
+  res.status(201).json({ ...serialize(studentsRepository.findById(req.params.schoolId, id)), duplicate_name: !!dupName });
 });
 
 studentsRouter.put('/:id', requireMembership(['admin', 'front_desk']), (req, res) => {
-  const existing = db
-    .prepare('SELECT * FROM students WHERE school_id = ? AND id = ?')
-    .get(req.params.schoolId, req.params.id);
+  const existing = studentsRepository.findById(req.params.schoolId, req.params.id);
   if (!existing) return res.status(404).json({ error: 'not found' });
 
   const {
@@ -230,39 +224,38 @@ studentsRouter.put('/:id', requireMembership(['admin', 'front_desk']), (req, res
     status = existing.status,
   } = req.body;
 
-  const dupName = db
-    .prepare('SELECT id FROM students WHERE school_id = ? AND name = ? AND id != ?')
-    .get(req.params.schoolId, name, req.params.id);
+  const dupName = studentsRepository.findByName(req.params.schoolId, name, req.params.id);
 
-  db.prepare(
-    `UPDATE students SET name=?, grade=?, school_name=?, subjects=?, teacher_id=?, tuition_monthly=?, note=?, status=?, updated_at=datetime('now')
-     WHERE id = ?`
-  ).run(
+  studentsRepository.update(req.params.id, {
     name,
     grade,
-    school_name,
-    JSON.stringify(subjects),
-    teacher_id,
-    tuition_monthly,
+    schoolName: school_name,
+    subjects,
+    teacherId: teacher_id,
+    tuitionMonthly: tuition_monthly,
     note,
     status,
-    req.params.id
-  );
+  });
 
   broadcastChange(req.params.schoolId, 'students');
-  res.json({ ...serialize(db.prepare('SELECT * FROM students WHERE id = ?').get(req.params.id)), duplicate_name: !!dupName });
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.STUDENTS, action: 'student.update',
+    message: `更新學生「${name}」`, userId: req.user.id, schoolId: req.params.schoolId, entityType: 'student', entityId: req.params.id,
+  });
+  res.json({ ...serialize(studentsRepository.findById(req.params.schoolId, req.params.id)), duplicate_name: !!dupName });
 });
 
 studentsRouter.delete('/:id', requireMembership(['admin', 'front_desk']), (req, res) => {
-  const existing = db.prepare('SELECT * FROM students WHERE school_id = ? AND id = ?').get(req.params.schoolId, req.params.id);
+  const existing = studentsRepository.findById(req.params.schoolId, req.params.id);
   if (!existing) return res.status(204).end();
 
   addToTrash(req.params.schoolId, 'student', existing.name, captureStudent(req.params.id), req.user.id);
 
-  db.prepare('DELETE FROM students WHERE school_id = ? AND id = ?').run(
-    req.params.schoolId,
-    req.params.id
-  );
+  studentsRepository.delete(req.params.schoolId, req.params.id);
   broadcastChange(req.params.schoolId, 'students');
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.STUDENTS, action: 'student.delete',
+    message: `刪除學生「${existing.name}」`, userId: req.user.id, schoolId: req.params.schoolId, entityType: 'student', entityId: req.params.id,
+  });
   res.status(204).end();
 });

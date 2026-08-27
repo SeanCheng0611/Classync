@@ -289,6 +289,33 @@ CREATE TABLE IF NOT EXISTS trash (
 );
 CREATE INDEX IF NOT EXISTS idx_trash_school ON trash(school_id, deleted_at);
 
+-- 通用診斷/稽核事件紀錄，不綁教育業。log_type 是給前端做「Audit / Diagnostic」分頁切換用的一級欄位
+-- （不是從 category 現算，避免每個 UI 各自維護一份對照表）；category 是細分類，page_key 對應
+-- client/server 兩邊各自的 constants/pageKeys.js（要保持同步）。tenant scope 目前借用 school_id，
+-- 之後 Generic Core Phase 若改成 organization_id，這張表要跟著調整，見 POSTGRES_MIGRATION_NOTES.md。
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  log_type TEXT NOT NULL CHECK (log_type IN ('audit', 'diagnostic')),
+  level TEXT NOT NULL DEFAULT 'INFO' CHECK (level IN ('INFO', 'WARN', 'ERROR')),
+  category TEXT NOT NULL CHECK (category IN ('USER_ACTION', 'DATA_CHANGE', 'AUTH', 'SECURITY', 'SYSTEM', 'ERROR', 'AUTOMATION', 'INTEGRATION')),
+  page_key TEXT,
+  action TEXT NOT NULL,
+  message TEXT NOT NULL,
+  user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  school_id TEXT REFERENCES schools(id) ON DELETE CASCADE,
+  entity_type TEXT,
+  entity_id TEXT,
+  request_id TEXT,
+  metadata_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_type_created ON audit_logs(log_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_page_key ON audit_logs(page_key, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_level ON audit_logs(level, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON audit_logs(user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_school ON audit_logs(school_id);
+
 CREATE INDEX IF NOT EXISTS idx_students_school ON students(school_id);
 CREATE INDEX IF NOT EXISTS idx_teachers_school ON teachers(school_id);
 CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships(user_id);

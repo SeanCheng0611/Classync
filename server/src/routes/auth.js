@@ -2,7 +2,10 @@ import { Router } from 'express';
 import { nanoid } from 'nanoid';
 import { db } from '../db/index.js';
 import { requireAuth } from '../auth/middleware.js';
-import { setSessionCookie, clearSessionCookie } from '../auth/session.js';
+import { SESSION_COOKIE, verifySession, setSessionCookie, clearSessionCookie } from '../auth/session.js';
+import { clearAdminSessionCookie } from '../auth/adminSession.js';
+import { logEvent } from '../services/auditLog.service.js';
+import { PAGE_KEYS } from '../constants/pageKeys.js';
 
 export const authRouter = Router();
 
@@ -99,6 +102,7 @@ authRouter.get('/line/callback', async (req, res) => {
     });
 
     setSessionCookie(res, userId);
+    logEvent({ category: 'AUTH', pageKey: PAGE_KEYS.AUTH, action: 'login.line', message: 'LINE 登入成功', userId });
     const returnOrigin = req.cookies?.[RETURN_COOKIE] || allowedOrigins()[0];
     res.clearCookie(RETURN_COOKIE);
     res.redirect(returnOrigin);
@@ -123,6 +127,7 @@ authRouter.post('/dev/login', (req, res) => {
     picture_url: null,
   });
   setSessionCookie(res, userId);
+  logEvent({ category: 'AUTH', pageKey: PAGE_KEYS.AUTH, action: 'login.dev', message: '開發用假登入', userId });
   res.json({ ok: true });
 });
 
@@ -147,6 +152,13 @@ authRouter.get('/me', requireAuth, (req, res) => {
 });
 
 authRouter.post('/logout', (req, res) => {
+  // logout 不強制要求已登入（沿用原本行為，未登入呼叫也回 200），但如果能辨識出使用者就順便記一筆、
+  // 並清掉 admin mode（一般使用者登出時，管理者模式一併失效，見 docs/ADMIN_MODE.md）
+  const token = req.cookies?.[SESSION_COOKIE];
+  const userId = token && verifySession(token);
+  if (userId) logEvent({ category: 'AUTH', pageKey: PAGE_KEYS.AUTH, action: 'logout', message: '登出', userId });
+
   clearSessionCookie(res);
+  clearAdminSessionCookie(res);
   res.json({ ok: true });
 });

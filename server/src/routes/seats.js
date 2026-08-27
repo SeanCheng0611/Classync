@@ -1,19 +1,16 @@
 import { Router } from 'express';
 import { nanoid } from 'nanoid';
-import { db } from '../db/index.js';
+import { seatsRepository } from '../repositories/index.js';
 import { requireMembership } from '../auth/middleware.js';
 import { broadcastChange } from '../realtime/index.js';
+import { logEvent } from '../services/auditLog.service.js';
+import { PAGE_KEYS } from '../constants/pageKeys.js';
 
 export const seatsRouter = Router({ mergeParams: true });
 seatsRouter.use(requireMembership());
 
 function serialize(row) {
-  const students = db
-    .prepare(
-      `SELECT s.id, s.name FROM seat_students ss JOIN students s ON s.id = ss.student_id WHERE ss.seat_assignment_id = ?`
-    )
-    .all(row.id);
-  return { ...row, students };
+  return { ...row, students: seatsRepository.findStudents(row.id) };
 }
 
 seatsRouter.get('/', (req, res) => {
@@ -21,9 +18,7 @@ seatsRouter.get('/', (req, res) => {
   if (!date || time_slot === undefined) {
     return res.status(400).json({ error: 'date and time_slot query params required' });
   }
-  const rows = db
-    .prepare('SELECT * FROM seat_assignments WHERE school_id = ? AND seat_date = ? AND time_slot = ?')
-    .all(req.params.schoolId, date, time_slot);
+  const rows = seatsRepository.findByDateAndSlot(req.params.schoolId, date, time_slot);
   res.json(rows.map(serialize));
 });
 
@@ -40,13 +35,7 @@ seatsRouter.put('/:seatNumber', requireMembership(['admin', 'front_desk']), (req
   const students = student_ids || [];
   if (students.length > 2) return res.status(400).json({ error: '每桌最多兩名學生' });
 
-  const otherSeatsSameSlot = db
-    .prepare(
-      `SELECT sa.seat_number, sa.teacher_id, s.student_id FROM seat_assignments sa
-       LEFT JOIN seat_students s ON s.seat_assignment_id = sa.id
-       WHERE sa.school_id = ? AND sa.seat_date = ? AND sa.time_slot = ? AND sa.seat_number != ?`
-    )
-    .all(req.params.schoolId, date, time_slot, seatNumber);
+  const otherSeatsSameSlot = seatsRepository.findOtherSeatsSameSlot(req.params.schoolId, date, time_slot, seatNumber);
 
   if (teacher_id && otherSeatsSameSlot.some((r) => r.teacher_id === teacher_id)) {
     return res.status(400).json({ error: '該教師此時段已被安排在其他桌' });
@@ -57,29 +46,27 @@ seatsRouter.put('/:seatNumber', requireMembership(['admin', 'front_desk']), (req
     }
   }
 
-  let row = db
-    .prepare(
-      'SELECT * FROM seat_assignments WHERE school_id = ? AND seat_date = ? AND time_slot = ? AND seat_number = ?'
-    )
-    .get(req.params.schoolId, date, time_slot, seatNumber);
+  const existingRow = seatsRepository.findByDateSlotAndSeat(req.params.schoolId, date, time_slot, seatNumber);
+  const id = existingRow?.id || nanoid();
 
-  if (!row) {
-    const id = nanoid();
-    db.prepare(
-      `INSERT INTO seat_assignments (id, school_id, seat_date, time_slot, seat_number, teacher_id)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(id, req.params.schoolId, date, time_slot, seatNumber, teacher_id || null);
-    row = db.prepare('SELECT * FROM seat_assignments WHERE id = ?').get(id);
-  } else {
-    db.prepare('UPDATE seat_assignments SET teacher_id = ? WHERE id = ?').run(teacher_id || null, row.id);
-  }
-
-  db.prepare('DELETE FROM seat_students WHERE seat_assignment_id = ?').run(row.id);
-  const insert = db.prepare('INSERT INTO seat_students (seat_assignment_id, student_id) VALUES (?, ?)');
-  for (const sid of students) insert.run(row.id, sid);
+  seatsRepository.upsertAssignment({
+    id,
+    schoolId: req.params.schoolId,
+    date,
+    timeSlot: time_slot,
+    seatNumber,
+    teacherId: teacher_id || null,
+    students,
+    isNew: !existingRow,
+  });
 
   broadcastChange(req.params.schoolId, 'seats');
-  res.json(serialize(db.prepare('SELECT * FROM seat_assignments WHERE id = ?').get(row.id)));
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.SEATS, action: 'seat.update',
+    message: `更新座位 #${seatNumber}（${date} ${time_slot}）`, userId: req.user.id, schoolId: req.params.schoolId,
+    entityType: 'seat_assignment', entityId: id,
+  });
+  res.json(serialize(seatsRepository.findById(id)));
 });
 
 seatsRouter.delete('/:seatNumber', requireMembership(['admin', 'front_desk']), (req, res) => {
@@ -88,9 +75,7 @@ seatsRouter.delete('/:seatNumber', requireMembership(['admin', 'front_desk']), (
   if (!date || time_slot === undefined) {
     return res.status(400).json({ error: 'date and time_slot query params required' });
   }
-  db.prepare(
-    'DELETE FROM seat_assignments WHERE school_id = ? AND seat_date = ? AND time_slot = ? AND seat_number = ?'
-  ).run(req.params.schoolId, date, time_slot, seatNumber);
+  seatsRepository.deleteAssignment(req.params.schoolId, date, time_slot, seatNumber);
   broadcastChange(req.params.schoolId, 'seats');
   res.status(204).end();
 });

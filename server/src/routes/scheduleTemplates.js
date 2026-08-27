@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { nanoid } from 'nanoid';
-import { db } from '../db/index.js';
+import { schedulingRepository, teachersRepository, studentsRepository } from '../repositories/index.js';
 import { requireMembership } from '../auth/middleware.js';
 import { broadcastChange } from '../realtime/index.js';
 import {
@@ -12,6 +12,8 @@ import {
 } from '../services/conflicts.js';
 import { WEEKDAY_LABELS, slotRangeLabel } from '../services/timeLabels.js';
 import { addToTrash, captureScheduleTemplate } from '../services/trash.js';
+import { logEvent } from '../services/auditLog.service.js';
+import { PAGE_KEYS } from '../constants/pageKeys.js';
 
 export const scheduleTemplatesRouter = Router({ mergeParams: true });
 scheduleTemplatesRouter.use(requireMembership());
@@ -25,7 +27,7 @@ function checkTemplateConflicts(
     schoolId, teacherId, weekday, startSlot, durationSlots, excludeTemplateId, activeFrom, activeUntil
   );
   if (teacherConflict) {
-    const teacher = db.prepare('SELECT name FROM teachers WHERE id = ?').get(teacherId);
+    const teacher = teachersRepository.findById(schoolId, teacherId);
     return `教師「${teacher?.name || ''}」星期${WEEKDAY_LABELS[weekday]} ${slotRangeLabel(startSlot, durationSlots)} 已有其他固定課（${teacherConflict.subject}），時段重疊`;
   }
   for (const studentId of studentIds || []) {
@@ -33,7 +35,7 @@ function checkTemplateConflicts(
       schoolId, studentId, weekday, startSlot, durationSlots, excludeTemplateId, activeFrom, activeUntil
     );
     if (conflict) {
-      const student = db.prepare('SELECT name FROM students WHERE id = ?').get(studentId);
+      const student = studentsRepository.findById(schoolId, studentId);
       return `學生「${student?.name || ''}」星期${WEEKDAY_LABELS[weekday]} ${slotRangeLabel(startSlot, durationSlots)} 已有其他固定課（${conflict.subject}），時段重疊`;
     }
   }
@@ -41,9 +43,7 @@ function checkTemplateConflicts(
 }
 
 function withStudents(row) {
-  const students = db
-    .prepare('SELECT student_id, unit_price FROM template_students WHERE template_id = ?')
-    .all(row.id);
+  const students = schedulingRepository.findTemplateStudents(row.id);
   return { ...row, students, student_ids: students.map((s) => s.student_id) };
 }
 
@@ -54,26 +54,12 @@ function normalizeStudents(body) {
   return undefined;
 }
 
-function setStudents(templateId, students) {
-  db.prepare('DELETE FROM template_students WHERE template_id = ?').run(templateId);
-  const insert = db.prepare(
-    'INSERT INTO template_students (template_id, student_id, unit_price) VALUES (?, ?, ?)'
-  );
-  for (const { student_id, unit_price } of students || []) insert.run(templateId, student_id, unit_price || 0);
-}
-
 // 教師只能查看自己任教的固定課（唯讀），管理者可查看全部
 scheduleTemplatesRouter.get('/', (req, res) => {
   const rows =
     req.membership.role !== 'teacher'
-      ? db
-          .prepare('SELECT * FROM schedule_templates WHERE school_id = ? ORDER BY weekday, start_slot')
-          .all(req.params.schoolId)
-      : db
-          .prepare(
-            'SELECT * FROM schedule_templates WHERE school_id = ? AND teacher_id = ? ORDER BY weekday, start_slot'
-          )
-          .all(req.params.schoolId, req.membership.teacher_id || '');
+      ? schedulingRepository.findTemplatesBySchool(req.params.schoolId)
+      : schedulingRepository.findTemplatesBySchoolAndTeacher(req.params.schoolId, req.membership.teacher_id);
   res.json(rows.map(withStudents));
 });
 
@@ -135,37 +121,37 @@ scheduleTemplatesRouter.post('/', requireMembership(['admin', 'front_desk']), (r
   const createdIds = [];
   for (const [segStart, segEnd] of segments) {
     const id = nanoid();
-    db.prepare(
-      `INSERT INTO schedule_templates (id, school_id, teacher_id, subject, weekday, start_slot, duration_slots, active_from, active_until, note, rate_override)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
+    schedulingRepository.createTemplate({
       id,
-      req.params.schoolId,
-      teacher_id,
+      schoolId: req.params.schoolId,
+      teacherId: teacher_id,
       subject,
-      weekdayNum,
-      segStart,
-      segEnd - segStart,
-      activeFromVal,
-      activeUntilVal,
-      note || null,
-      rate_override != null ? Number(rate_override) : null
-    );
-    setStudents(id, studentEntries);
+      weekday: weekdayNum,
+      startSlot: segStart,
+      durationSlots: segEnd - segStart,
+      activeFrom: activeFromVal,
+      activeUntil: activeUntilVal,
+      note: note || null,
+      rateOverride: rate_override != null ? Number(rate_override) : null,
+      students: studentEntries,
+    });
     createdIds.push(id);
   }
 
   broadcastChange(req.params.schoolId, 'schedule');
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.SCHEDULE, action: 'schedule_template.create',
+    message: `新增固定課「${subject}」`, userId: req.user.id, schoolId: req.params.schoolId,
+    entityType: 'schedule_template', entityId: createdIds[0], metadata: { count: createdIds.length },
+  });
   res.status(201).json({
-    templates: createdIds.map((tid) => withStudents(db.prepare('SELECT * FROM schedule_templates WHERE id = ?').get(tid))),
+    templates: createdIds.map((tid) => withStudents(schedulingRepository.findTemplateById(req.params.schoolId, tid))),
     auto_adjusted: autoAdjusted,
   });
 });
 
 scheduleTemplatesRouter.put('/:id', requireMembership(['admin', 'front_desk']), (req, res) => {
-  const existing = db
-    .prepare('SELECT * FROM schedule_templates WHERE school_id = ? AND id = ?')
-    .get(req.params.schoolId, req.params.id);
+  const existing = schedulingRepository.findTemplateById(req.params.schoolId, req.params.id);
   if (!existing) return res.status(404).json({ error: 'not found' });
 
   const {
@@ -198,76 +184,75 @@ scheduleTemplatesRouter.put('/:id', requireMembership(['admin', 'front_desk']), 
   if (conflictMsg) return res.status(409).json({ error: conflictMsg });
 
   const nextRateOverride = rate_override != null ? Number(rate_override) : null;
-  db.prepare(
-    `UPDATE schedule_templates SET teacher_id=?, subject=?, weekday=?, start_slot=?, duration_slots=?, active_from=?, active_until=?, note=?, rate_override=?
-     WHERE id = ?`
-  ).run(teacher_id, subject, weekday, start_slot, duration_slots, active_from, active_until, note, nextRateOverride, req.params.id);
 
-  if (rate_override !== existing.rate_override) {
-    // 樣板時薪覆寫值變動時，把已展開但尚未發生的課堂一併同步，避免舊課堂還沿用舊值
-    db.prepare(
-      `UPDATE class_sessions SET rate_override = ? WHERE template_id = ? AND session_date >= date('now')`
-    ).run(nextRateOverride, req.params.id);
-  }
-
-  if (req.body.active_until !== undefined && req.body.active_until) {
-    // 縮短樣板有效期間時，把已展開但落在新結束日之後、尚未發生的課堂一併取消
-    db.prepare(
-      `UPDATE class_sessions SET cancelled = 1
-       WHERE template_id = ? AND session_date > ? AND session_date >= date('now') AND cancelled = 0`
-    ).run(req.params.id, req.body.active_until);
-    broadcastChange(req.params.schoolId, 'sessions');
-  }
-
+  // 移除的學生（從既有名單比對，樣板移除學生時要一併把「尚未發生」的已展開課堂移除該生）
+  let removedStudentIds;
   if (normalized !== undefined) {
-    // 從樣板移除的學生，把「尚未發生」的已展開課堂也一併移除該生，避免課堂與出缺勤紀錄殘留失效的固定課
     const prevStudentIds = withStudents(existing).student_ids;
-    const removedIds = prevStudentIds.filter((sid) => !studentIds.includes(sid));
-    if (removedIds.length > 0) {
-      const futureSessions = db
-        .prepare(`SELECT id FROM class_sessions WHERE template_id = ? AND session_date >= date('now')`)
-        .all(req.params.id);
-      const delStudent = db.prepare('DELETE FROM session_students WHERE session_id = ? AND student_id = ?');
-      for (const s of futureSessions) {
-        for (const sid of removedIds) delStudent.run(s.id, sid);
-      }
-      broadcastChange(req.params.schoolId, 'sessions');
-    }
-    setStudents(req.params.id, normalized);
+    removedStudentIds = prevStudentIds.filter((sid) => !studentIds.includes(sid));
   }
+
+  const shouldCancelFutureSessions = req.body.active_until !== undefined && !!req.body.active_until;
+
+  schedulingRepository.updateTemplate(req.params.id, {
+    fields: {
+      teacherId: teacher_id,
+      subject,
+      weekday,
+      startSlot: start_slot,
+      durationSlots: duration_slots,
+      activeFrom: active_from,
+      activeUntil: active_until,
+      note,
+      rateOverride: nextRateOverride,
+    },
+    // 樣板時薪覆寫值變動時，把已展開但尚未發生的課堂一併同步，避免舊課堂還沿用舊值
+    syncRateOverride: rate_override !== existing.rate_override ? nextRateOverride : undefined,
+    // 縮短樣板有效期間時，把已展開但落在新結束日之後、尚未發生的課堂一併取消
+    cancelSessionsAfterDate: shouldCancelFutureSessions ? req.body.active_until : null,
+    students: normalized,
+    removedStudentIds,
+  });
+
+  // 跟原本邏輯一致：這兩個條件各自獨立、都基於「輸入是否要求這麼做」而非「實際有沒有列被動到」，
+  // 都成立時會各自觸發一次 'sessions' 廣播（可能共兩次，跟原本行為一致）
+  if (shouldCancelFutureSessions) broadcastChange(req.params.schoolId, 'sessions');
+  if (removedStudentIds && removedStudentIds.length > 0) broadcastChange(req.params.schoolId, 'sessions');
 
   broadcastChange(req.params.schoolId, 'schedule');
-  res.json(withStudents(db.prepare('SELECT * FROM schedule_templates WHERE id = ?').get(req.params.id)));
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.SCHEDULE, action: 'schedule_template.update',
+    message: `更新固定課「${subject}」`, userId: req.user.id, schoolId: req.params.schoolId,
+    entityType: 'schedule_template', entityId: req.params.id,
+  });
+  res.json(withStudents(schedulingRepository.findTemplateById(req.params.schoolId, req.params.id)));
 });
 
 scheduleTemplatesRouter.delete('/:id', requireMembership(['admin', 'front_desk']), (req, res) => {
-  const existing = db
-    .prepare('SELECT * FROM schedule_templates WHERE school_id = ? AND id = ?')
-    .get(req.params.schoolId, req.params.id);
+  const existing = schedulingRepository.findTemplateById(req.params.schoolId, req.params.id);
   if (!existing) return res.status(404).json({ error: 'not found' });
 
-  // 停開整堂固定課：已展開但尚未發生的課堂一併取消，避免課堂與出缺勤紀錄殘留失效的固定課
-  const toCancel = db
-    .prepare(`SELECT id FROM class_sessions WHERE template_id = ? AND session_date >= date('now') AND cancelled = 0`)
-    .all(req.params.id)
-    .map((r) => r.id);
-  db.prepare(
-    `UPDATE class_sessions SET cancelled = 1 WHERE template_id = ? AND session_date >= date('now') AND cancelled = 0`
-  ).run(req.params.id);
-
-  const teacher = db.prepare('SELECT name FROM teachers WHERE id = ?').get(existing.teacher_id);
+  const teacher = teachersRepository.findById(req.params.schoolId, existing.teacher_id);
   const label = `${existing.subject} 星期${WEEKDAY_LABELS[existing.weekday]} ${slotRangeLabel(existing.start_slot, existing.duration_slots)}（${teacher?.name || '未知教師'}）`;
-  const studentIds = db.prepare('SELECT student_id FROM template_students WHERE template_id = ?').all(req.params.id).map((r) => r.student_id);
+  const studentIds = schedulingRepository.findTemplateStudents(req.params.id).map((r) => r.student_id);
+
+  // 停開整堂固定課：已展開但尚未發生的課堂一併取消（atomic），接著在 template 列還存在時擷取快照存進回收桶，
+  // 最後才真正刪除 template——captureScheduleTemplate 需要讀到還沒被刪除的 template 列，順序不能顛倒
+  const toCancel = schedulingRepository.cancelFutureSessionsByTemplate(req.params.id);
+
   addToTrash(req.params.schoolId, 'schedule_template', label, captureScheduleTemplate(req.params.id, toCancel), req.user.id, {
     studentIds,
     teacherId: existing.teacher_id,
   });
 
-  db.prepare('DELETE FROM schedule_templates WHERE school_id = ? AND id = ?').run(
-    req.params.schoolId,
-    req.params.id
-  );
+  schedulingRepository.deleteTemplate(req.params.schoolId, req.params.id);
+
   broadcastChange(req.params.schoolId, 'schedule');
   broadcastChange(req.params.schoolId, 'sessions');
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.SCHEDULE, action: 'schedule_template.delete',
+    message: `刪除固定課「${label}」`, userId: req.user.id, schoolId: req.params.schoolId,
+    entityType: 'schedule_template', entityId: req.params.id,
+  });
   res.status(204).end();
 });

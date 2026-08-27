@@ -1,11 +1,17 @@
-import { NavLink, Outlet } from 'react-router-dom';
+import { NavLink, Outlet, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { useAdminMode } from '../context/AdminModeContext';
 import { useScrollMemory } from '../lib/useScrollMemory';
+import { pageKeyForPath } from '../constants/pageKeys';
+import PageLogViewer from './admin/PageLogViewer';
 
 const navLinkClass = ({ isActive }) => `nav-link${isActive ? ' nav-link-active' : ''}`;
 
 export default function Layout() {
   const { user, memberships, currentSchoolId, currentMembership, setCurrentSchoolId, logout } = useAuth();
+  const { isAdminMode } = useAdminMode();
+  const location = useLocation();
+  const currentPageKey = pageKeyForPath(location.pathname);
   useScrollMemory();
 
   return (
@@ -28,6 +34,7 @@ export default function Layout() {
           )}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          {isAdminMode && currentPageKey && <PageLogViewer pageKey={currentPageKey} />}
           <span style={{ color: 'var(--text-muted)', fontSize: 13 }}>{user?.display_name}</span>
           <button onClick={logout}>登出</button>
         </div>
@@ -49,6 +56,7 @@ export default function Layout() {
             <NavLink to="/settings" className={navLinkClass}>設定</NavLink>
           </>
         )}
+        {isAdminMode && <NavLink to="/admin" className={navLinkClass}>管理者</NavLink>}
         <NavLink to="/schools" className={navLinkClass}>切換補習班</NavLink>
       </nav>
 

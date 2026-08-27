@@ -1,10 +1,11 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
 import { subscribeSchool } from '../socket';
 import TimeInput from '../components/TimeInput';
 import { DEFAULT_SUBJECTS, parseSubjects } from '../lib/subjects';
 import { SWATCHES, TAG_TYPES, DEFAULT_TYPE_COLORS, parseTypeColors, DEFAULT_TYPE_ORDER, parseTypeOrder, parseAttendanceTypeOrder } from '../lib/sessionType';
+import AdminUnlockDialog from '../components/admin/AdminUnlockDialog';
 
 const TYPE_ORDER_LABELS = Object.fromEntries(TAG_TYPES.map(({ key, label }) => [key, label]));
 
@@ -109,12 +110,34 @@ function SettingsSection({ title, open, onToggle, onSubmit, children }) {
   );
 }
 
+const ADMIN_UNLOCK_TAP_TARGET = 10;
+const ADMIN_UNLOCK_TAP_RESET_MS = 4000;
+
 export default function Settings() {
   const { currentSchoolId, currentMembership } = useAuth();
   const isAdmin = currentMembership?.role === 'admin';
 
   const [school, setSchool] = useState(null);
   const [error, setError] = useState('');
+
+  // 隱藏的管理者模式入口：連續點擊頁面標題 10 次跳出密碼輸入框。10 次本身不是驗證，只是找到入口的方式，
+  // 真正的密碼驗證在 backend（見 components/admin/AdminUnlockDialog.jsx）
+  const [tapCount, setTapCount] = useState(0);
+  const [showUnlockDialog, setShowUnlockDialog] = useState(false);
+  const tapResetTimer = useRef(null);
+  const handleTitleTap = () => {
+    setTapCount((prev) => {
+      const next = prev + 1;
+      clearTimeout(tapResetTimer.current);
+      if (next >= ADMIN_UNLOCK_TAP_TARGET) {
+        setShowUnlockDialog(true);
+        return 0;
+      }
+      tapResetTimer.current = setTimeout(() => setTapCount(0), ADMIN_UNLOCK_TAP_RESET_MS);
+      return next;
+    });
+  };
+  const remainingTaps = ADMIN_UNLOCK_TAP_TARGET - tapCount;
 
   const [sectionOrder, setSectionOrder] = useState(DEFAULT_SECTION_ORDER);
   const [dragSection, setDragSection] = useState(null); // { category, index }：目前拖曳中的區塊屬於哪個分類、在該分類內第幾個
@@ -453,7 +476,13 @@ export default function Settings() {
 
   return (
     <div style={{ maxWidth: 1100, margin: '0 auto' }}>
-      <h2>設定</h2>
+      <h2 onClick={handleTitleTap} style={{ userSelect: 'none', cursor: 'default', display: 'inline-block' }}>
+        設定
+      </h2>
+      {tapCount >= 7 && tapCount < ADMIN_UNLOCK_TAP_TARGET && (
+        <p style={{ color: 'var(--text-muted)', fontSize: 12, margin: '0 0 8px' }}>還差 {remainingTaps} 次</p>
+      )}
+      {showUnlockDialog && <AdminUnlockDialog onClose={() => setShowUnlockDialog(false)} />}
       {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
 
       {SECTION_CATEGORIES.map(({ title: category, keys }, catIdx) => {

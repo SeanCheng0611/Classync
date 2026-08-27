@@ -23,6 +23,7 @@ import { notesRouter } from './routes/notes.js';
 import { trashRouter } from './routes/trash.js';
 import { devRouter } from './routes/dev.js';
 import { deployRouter } from './routes/deploy.js';
+import { adminRouter } from './routes/admin.js';
 import { requireAuth } from './auth/middleware.js';
 import { initRealtime } from './realtime/index.js';
 import { startTrashPurgeScheduler } from './services/trash.js';
@@ -58,6 +59,7 @@ app.use('/api/schools/:schoolId/notes', requireAuth, notesRouter);
 app.use('/api/schools/:schoolId/trash', requireAuth, trashRouter);
 app.use('/api/dev', devRouter);
 app.use('/api/deploy-webhook', deployRouter);
+app.use('/api/admin', adminRouter);
 
 startTrashPurgeScheduler();
 

@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from './context/AuthContext';
+import { AdminModeProvider, useAdminMode } from './context/AdminModeContext';
 import Login from './pages/Login';
 import SchoolPicker from './pages/SchoolPicker';
 import Students from './pages/Students';
@@ -18,10 +19,12 @@ import Members from './pages/Members';
 import Notes from './pages/Notes';
 import TrashPage from './pages/TrashPage';
 import Settings from './pages/Settings';
+import AdminPage from './pages/AdminPage';
 import Layout from './components/Layout';
 
 function Gate() {
   const { user, loading, currentSchoolId } = useAuth();
+  const { isAdminMode } = useAdminMode();
 
   if (loading) return <p style={{ padding: 20 }}>載入中...</p>;
   if (!user) return <Login />;
@@ -65,6 +68,7 @@ function Gate() {
           <Route path="/notes" element={<Notes />} />
           <Route path="/notes/trash" element={<TrashPage title="記事回收桶" entityTypes={['note']} />} />
           <Route path="/settings" element={<Settings />} />
+          <Route path="/admin" element={isAdminMode ? <AdminPage /> : <Navigate to="/students" replace />} />
           <Route path="*" element={<Navigate to="/students" replace />} />
         </Route>
       ) : (
@@ -78,7 +82,9 @@ export default function App() {
   return (
     <BrowserRouter>
       <AuthProvider>
-        <Gate />
+        <AdminModeProvider>
+          <Gate />
+        </AdminModeProvider>
       </AuthProvider>
     </BrowserRouter>
   );
