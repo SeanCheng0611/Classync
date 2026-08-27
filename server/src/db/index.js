@@ -71,6 +71,7 @@ ensureColumn('schools', 'default_class_duration_hours', 'default_class_duration_
 ensureColumn('schools', 'type_colors', `type_colors TEXT NOT NULL DEFAULT '{"regular":"camel","extra":"green","makeup":"blue","leave":"red"}'`);
 ensureColumn('schools', 'schedule_type_order', `schedule_type_order TEXT NOT NULL DEFAULT '["extra","makeup","regular"]'`);
 ensureColumn('schools', 'attendance_type_order', `attendance_type_order TEXT NOT NULL DEFAULT '["extra","makeup","regular"]'`);
+ensureColumn('schools', 'settings_section_order', `settings_section_order TEXT NOT NULL DEFAULT '[]'`);
 
 // 記事分類舊資料從英文代碼改為自由文字（開放使用者自訂分類前的舊值）
 db.exec(`UPDATE notes SET category = '待辦' WHERE category = 'todo'`);

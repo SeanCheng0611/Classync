@@ -112,7 +112,6 @@ export default function Schedule() {
   const [scheduleMode, setScheduleMode] = useState('single'); // 'single' | 'multiple'
   const [addClassForm, setAddClassForm] = useState(emptyAddClassForm);
   const [fixedForm, setFixedForm] = useState(emptyFixedForm);
-  const addClassFormRef = useRef(null);
 
   const cancelAddClass = () => {
     setShowAddClass(false);
@@ -120,8 +119,37 @@ export default function Schedule() {
     setAddClassForm(emptyAddClassForm());
     setFixedForm(emptyFixedForm());
     setError('');
-    window.scrollTo({ top: 0, behavior: 'smooth' });
   };
+
+  // 排課彈窗（單堂模式）只自動跳「學生→科目→教師」這三步，填完教師之後停下來讓使用者自己填日期/時間；
+  // 用 data-field 標記每個欄位的容器，填完後查表找下一個 key 對應的 input/select 直接 focus
+  const addClassModalRef = useRef(null);
+  const singleScheduleFieldOrder = (entryCount) => {
+    const order = [];
+    for (let i = 0; i < entryCount; i++) order.push(`student-${i}`);
+    order.push('subject', 'teacher');
+    return order;
+  };
+  const focusAddClassField = (fieldKey) => {
+    const order = singleScheduleFieldOrder(addClassForm.entries.length);
+    const idx = order.indexOf(fieldKey);
+    if (idx === -1) return;
+    const nextKey = order[idx + 1];
+    if (!nextKey) return;
+    requestAnimationFrame(() => {
+      addClassModalRef.current?.querySelector(`[data-field="${nextKey}"] input, [data-field="${nextKey}"] select`)?.focus();
+    });
+  };
+
+  // 排課彈窗一開啟就直接把焦點放到第一個學生欄位；觸控裝置不自動 focus，避免一開窗就跳出虛擬鍵盤
+  useEffect(() => {
+    if (!showAddClass) return;
+    const isTouchPrimary = window.matchMedia?.('(pointer: coarse)').matches;
+    if (isTouchPrimary) return;
+    requestAnimationFrame(() => {
+      addClassModalRef.current?.querySelector('[data-field="student-0"] input')?.focus();
+    });
+  }, [showAddClass]);
 
   const [rescheduleTarget, setRescheduleTarget] = useState(null); // { session, personId }：目前正在調課的課堂與學生，供畫面最外層的浮窗使用
   const [rescheduleForm, setRescheduleForm] = useState({ new_date: todayStr(), new_start_time: '', new_end_time: '', teacher_id: '' });
@@ -350,6 +378,21 @@ export default function Schedule() {
     }
   };
 
+  const markPresent = async (session, personId) => {
+    setError('');
+    try {
+      await api.post(`/api/schools/${currentSchoolId}/attendance`, {
+        session_id: session.id,
+        person_type: 'student',
+        person_id: personId,
+        status: 'present',
+      });
+      load();
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
   const startReschedule = (session, personId) => {
     setError('');
     setRescheduleTarget({ session, personId });
@@ -492,7 +535,6 @@ export default function Schedule() {
                   end_month: f.end_month || shiftMonth(f.start_month, spanMonths - 1),
                 }));
                 setShowAddClass(true);
-                requestAnimationFrame(() => addClassFormRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
               }}
             >
               {showAddClass ? '取消排課' : '+ 排課'}
@@ -650,6 +692,7 @@ export default function Schedule() {
                     session.students.map((s) => {
                       const record = records[recordKey(session.id, s.id)];
                       const onLeave = record?.status === 'leave';
+                      const isPresent = record?.status === 'present';
                       return (
                         <div key={s.id} style={{ marginTop: 4 }}>
                           <div style={{ fontSize: 12 }}>
@@ -657,13 +700,21 @@ export default function Schedule() {
                           </div>
                           <div style={{ display: 'flex', gap: 6, marginTop: 4, flexWrap: 'nowrap' }}>
                             {onLeave ? (
-                              <button style={{ fontSize: 13, padding: '5px 8px', flex: 1, whiteSpace: 'nowrap' }} onClick={() => undoStudent(session, s.id)}>
+                              <button style={{ fontSize: 12, padding: '5px 2px', flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} onClick={() => undoStudent(session, s.id)}>
                                 {record.makeup_arranged ? '取消調課' : '取消請假'}
+                              </button>
+                            ) : isPresent ? (
+                              <button
+                                style={{ fontSize: 12, padding: '5px 2px', flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontWeight: 'bold', background: 'var(--accent-soft)' }}
+                                onClick={() => undoStudent(session, s.id)}
+                              >
+                                出席
                               </button>
                             ) : (
                               <>
-                                <button style={{ fontSize: 13, padding: '5px 8px', flex: 1, whiteSpace: 'nowrap' }} onClick={() => leaveStudent(session, s.id)}>請假</button>
-                                <button style={{ fontSize: 13, padding: '5px 8px', flex: 1, whiteSpace: 'nowrap' }} onClick={() => startReschedule(session, s.id)}>調課</button>
+                                <button style={{ fontSize: 12, padding: '5px 2px', flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} onClick={() => markPresent(session, s.id)}>出席</button>
+                                <button style={{ fontSize: 12, padding: '5px 2px', flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} onClick={() => leaveStudent(session, s.id)}>請假</button>
+                                <button style={{ fontSize: 12, padding: '5px 2px', flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} onClick={() => startReschedule(session, s.id)}>調課</button>
                               </>
                             )}
                           </div>
@@ -745,7 +796,36 @@ export default function Schedule() {
       )}
 
       {showAddClass && (
-        <div ref={addClassFormRef} style={{ marginTop: 24, maxWidth: 360, display: 'grid', gap: 8 }}>
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 100,
+            background: 'rgba(0, 0, 0, 0.35)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 16,
+          }}
+          onClick={cancelAddClass}
+        >
+          <div
+            ref={addClassModalRef}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: 'var(--surface)',
+              border: '1px solid var(--border-strong)',
+              borderRadius: 8,
+              boxShadow: 'var(--shadow)',
+              padding: 16,
+              width: 380,
+              maxWidth: '100%',
+              maxHeight: '90vh',
+              overflowY: 'auto',
+              display: 'grid',
+              gap: 8,
+            }}
+          >
           <h3 style={{ margin: 0 }}>排課</h3>
           {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
           <div style={{ display: 'flex', gap: 16 }}>
@@ -767,18 +847,36 @@ export default function Schedule() {
                 maxGroupSize={school?.group_class_max_students || 2}
                 entries={addClassForm.entries}
                 onChange={(entries) => setAddClassForm({ ...addClassForm, entries })}
+                onFieldComplete={focusAddClassField}
               />
-              <label>
+              <label data-field="subject">
                 科目
-                <SubjectSelect value={addClassForm.subject} onChange={(v) => setAddClassForm({ ...addClassForm, subject: v })} />
+                <SubjectSelect
+                  value={addClassForm.subject}
+                  onChange={(v) => {
+                    setAddClassForm({ ...addClassForm, subject: v });
+                    if (v) focusAddClassField('subject');
+                  }}
+                />
               </label>
-              <label>
+              <label data-field="teacher">
                 教師
-                <SearchSelect options={teachers} value={addClassForm.teacher_id} onChange={(v) => setAddClassForm({ ...addClassForm, teacher_id: v })} />
+                <SearchSelect
+                  options={teachers}
+                  value={addClassForm.teacher_id}
+                  onChange={(v) => {
+                    setAddClassForm({ ...addClassForm, teacher_id: v });
+                    focusAddClassField('teacher');
+                  }}
+                />
               </label>
               <label>
                 日期
-                <input type="date" value={addClassForm.date} onChange={(e) => setAddClassForm({ ...addClassForm, date: e.target.value })} />
+                <input
+                  type="date"
+                  value={addClassForm.date}
+                  onChange={(e) => setAddClassForm({ ...addClassForm, date: e.target.value })}
+                />
               </label>
               <div style={{ display: 'flex', gap: 8 }}>
                 <label>
@@ -877,6 +975,7 @@ export default function Schedule() {
               </div>
             </form>
           )}
+          </div>
         </div>
       )}
 

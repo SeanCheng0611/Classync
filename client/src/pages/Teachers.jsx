@@ -21,6 +21,7 @@ import {
   flexibleScheduleFormToPayload,
   FLEXIBLE_SCHEDULE_WEEKDAYS,
 } from '../lib/flexibleSchedule';
+import { useAutoFocusSearch } from '../lib/useAutoFocusSearch';
 
 const emptyForm = {
   name: '',
@@ -66,6 +67,7 @@ export default function Teachers() {
 
   const [teachers, setTeachers] = useState([]);
   const [search, setSearch] = useState('');
+  const searchInputRef = useAutoFocusSearch();
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState(emptyForm);
   const [error, setError] = useState('');
@@ -435,6 +437,7 @@ export default function Teachers() {
       {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
 
       <input
+        ref={searchInputRef}
         type="text"
         placeholder="搜尋姓名..."
         value={search}

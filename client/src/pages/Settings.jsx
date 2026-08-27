@@ -8,8 +8,46 @@ import { SWATCHES, TAG_TYPES, DEFAULT_TYPE_COLORS, parseTypeColors, DEFAULT_TYPE
 
 const TYPE_ORDER_LABELS = Object.fromEntries(TAG_TYPES.map(({ key, label }) => [key, label]));
 
-// 固定課/加課/調課排列順序的拖曳排序清單，課表排列順序／點名排列順序共用同一套邏輯
-function TypeOrderEditor({ value, onChange }) {
+// 每個設定區塊的標題，也是「設定」頁面本身區塊排序功能的依據（見 DEFAULT_SECTION_ORDER / parseSectionOrder）
+const SECTION_TITLES = {
+  timeRange: '上課時段設定',
+  group: '團體班人數上限',
+  span: '固定課展延月數',
+  typeColors: '課表標註顏色',
+  typeOrder: '課表排列順序',
+  attendanceOrder: '點名排列順序',
+  tuition: '學費預設金額',
+  subjects: '科目選單設定',
+};
+
+// 設定區塊分類：只能在同一分類內拖曳調整順序，不會跨分類混在一起
+const SECTION_CATEGORIES = [
+  { title: '排課設定', keys: ['timeRange', 'group', 'span', 'typeColors', 'typeOrder', 'attendanceOrder'] },
+  { title: '收費與科目', keys: ['tuition', 'subjects'] },
+];
+
+// 預設順序：同分類內依標題字數由少到多排列（字數相同的維持原本宣告順序），使用者可在頁面上拖曳調整、之後就記住自訂順序
+const DEFAULT_SECTION_ORDER = SECTION_CATEGORIES.flatMap(({ keys }) =>
+  keys.slice().sort((a, b) => SECTION_TITLES[a].length - SECTION_TITLES[b].length)
+);
+
+function parseSectionOrder(schoolSettings) {
+  try {
+    const parsed = JSON.parse(schoolSettings?.settings_section_order || '[]');
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      // 過濾掉不存在的 key（例如舊資料殘留），把新增的區塊（尚未出現在使用者自訂順序裡）補到最後
+      const filtered = parsed.filter((k) => SECTION_TITLES[k]);
+      const missing = DEFAULT_SECTION_ORDER.filter((k) => !filtered.includes(k));
+      return [...filtered, ...missing];
+    }
+  } catch {
+    // 解析失敗就用預設順序
+  }
+  return DEFAULT_SECTION_ORDER;
+}
+
+// 通用的拖曳排序清單：固定課/加課/調課排列順序（課表／點名排列順序）共用同一套邏輯
+function DragOrderEditor({ value, labels, onChange }) {
   const [dragIndex, setDragIndex] = useState(null);
 
   const reorder = (fromIndex, toIndex) => {
@@ -45,7 +83,7 @@ function TypeOrderEditor({ value, onChange }) {
             background: dragIndex === i ? 'var(--surface-muted)' : undefined,
           }}
         >
-          <span>{i + 1}. {TYPE_ORDER_LABELS[key]}</span>
+          <span>{i + 1}. {labels[key]}</span>
           <span style={{ color: 'var(--text-muted)' }}>⠿</span>
         </div>
       ))}
@@ -53,18 +91,20 @@ function TypeOrderEditor({ value, onChange }) {
   );
 }
 
+// onSubmit 是選用的：有給就包一層 <form> 並顯示「儲存」按鈕，沒給（例如科目選單設定，動作即時生效不需要另外儲存）就單純顯示內容
 function SettingsSection({ title, open, onToggle, onSubmit, children }) {
   return (
     <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: 12, marginBottom: 12 }}>
       <button type="button" onClick={onToggle} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
         {title} {open ? '▲' : '▼'}
       </button>
-      {open && (
+      {open && onSubmit && (
         <form onSubmit={onSubmit} style={{ display: 'grid', gap: 8, maxWidth: 320, marginTop: 8 }}>
           {children}
           <div><button type="submit">儲存</button></div>
         </form>
       )}
+      {open && !onSubmit && <div style={{ display: 'grid', gap: 8, maxWidth: 320, marginTop: 8 }}>{children}</div>}
     </div>
   );
 }
@@ -75,6 +115,9 @@ export default function Settings() {
 
   const [school, setSchool] = useState(null);
   const [error, setError] = useState('');
+
+  const [sectionOrder, setSectionOrder] = useState(DEFAULT_SECTION_ORDER);
+  const [dragSection, setDragSection] = useState(null); // { category, index }：目前拖曳中的區塊屬於哪個分類、在該分類內第幾個
 
   const [openTuition, setOpenTuition] = useState(false);
   const [tuitionForm, setTuitionForm] = useState({ default_price_grade_1_6: 0, default_price_grade_7_9: 0, default_price_grade_10_12: 0 });
@@ -105,6 +148,7 @@ export default function Settings() {
     try {
       const sch = await api.get(`/api/schools/${currentSchoolId}`);
       setSchool(sch);
+      setSectionOrder(parseSectionOrder(sch));
       setTuitionForm({
         default_price_grade_1_6: sch.default_price_grade_1_6,
         default_price_grade_7_9: sch.default_price_grade_7_9,
@@ -140,6 +184,25 @@ export default function Settings() {
   if (!school) return <p>載入中...</p>;
 
   const subjects = parseSubjects(school);
+
+  // 拖曳調整設定區塊本身的順序：只能在同一分類內調整，立刻套用畫面、同時存回後端，不需要另外按「儲存」
+  const reorderSectionsWithinCategory = async (category, fromIndex, toIndex) => {
+    if (fromIndex === toIndex || fromIndex == null || toIndex == null) return;
+    const byCategory = SECTION_CATEGORIES.map(({ keys }) => sectionOrder.filter((k) => keys.includes(k)));
+    const catIdx = SECTION_CATEGORIES.findIndex((c) => c.title === category);
+    if (catIdx === -1) return;
+    const list = byCategory[catIdx].slice();
+    const [moved] = list.splice(fromIndex, 1);
+    list.splice(toIndex, 0, moved);
+    byCategory[catIdx] = list;
+    const next = byCategory.flat();
+    setSectionOrder(next);
+    try {
+      await api.put(`/api/schools/${currentSchoolId}/settings-section-order`, { settings_section_order: next });
+    } catch (err) {
+      setError(err.message);
+    }
+  };
 
   const saveSubjects = async (next) => {
     setError('');
@@ -253,14 +316,10 @@ export default function Settings() {
     }
   };
 
-  return (
-    <div style={{ maxWidth: 1100, margin: '0 auto' }}>
-      <h2>設定</h2>
-      {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
-
-      <h3 style={{ marginBottom: 4, color: 'var(--text-muted)', fontSize: 14, fontWeight: 600, letterSpacing: 1 }}>排課設定</h3>
-
-      <SettingsSection title="上課時段設定" open={openTimeRange} onToggle={() => setOpenTimeRange((v) => !v)} onSubmit={saveTimeRange}>
+  // 每個設定區塊的實際內容，key 對應 SECTION_TITLES；畫面上依 sectionOrder（可拖曳自訂）決定顯示順序
+  const sectionRenderers = {
+    timeRange: (
+      <SettingsSection title={SECTION_TITLES.timeRange} open={openTimeRange} onToggle={() => setOpenTimeRange((v) => !v)} onSubmit={saveTimeRange}>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <label>
             起始
@@ -289,8 +348,9 @@ export default function Settings() {
           />
         </label>
       </SettingsSection>
-
-      <SettingsSection title="團體班人數上限" open={openGroup} onToggle={() => setOpenGroup((v) => !v)} onSubmit={saveGroup}>
+    ),
+    group: (
+      <SettingsSection title={SECTION_TITLES.group} open={openGroup} onToggle={() => setOpenGroup((v) => !v)} onSubmit={saveGroup}>
         <label>
           單一時段最多學生數（一對 N）
           <input
@@ -301,8 +361,9 @@ export default function Settings() {
           />
         </label>
       </SettingsSection>
-
-      <SettingsSection title="固定課展延月數" open={openSpan} onToggle={() => setOpenSpan((v) => !v)} onSubmit={saveSpan}>
+    ),
+    span: (
+      <SettingsSection title={SECTION_TITLES.span} open={openSpan} onToggle={() => setOpenSpan((v) => !v)} onSubmit={saveSpan}>
         <label>
           結束月份留空時，預設展開幾個月
           <input
@@ -313,8 +374,9 @@ export default function Settings() {
           />
         </label>
       </SettingsSection>
-
-      <SettingsSection title="課表標註顏色" open={openTypeColors} onToggle={() => setOpenTypeColors((v) => !v)} onSubmit={saveTypeColors}>
+    ),
+    typeColors: (
+      <SettingsSection title={SECTION_TITLES.typeColors} open={openTypeColors} onToggle={() => setOpenTypeColors((v) => !v)} onSubmit={saveTypeColors}>
         {TAG_TYPES.map(({ key, label }) => (
           <div key={key}>
             <div style={{ marginBottom: 4 }}>{label}</div>
@@ -340,18 +402,19 @@ export default function Settings() {
           </div>
         ))}
       </SettingsSection>
-
-      <SettingsSection title="課表排列順序" open={openTypeOrder} onToggle={() => setOpenTypeOrder((v) => !v)} onSubmit={saveTypeOrder}>
-        <TypeOrderEditor value={typeOrderForm} onChange={setTypeOrderForm} />
+    ),
+    typeOrder: (
+      <SettingsSection title={SECTION_TITLES.typeOrder} open={openTypeOrder} onToggle={() => setOpenTypeOrder((v) => !v)} onSubmit={saveTypeOrder}>
+        <DragOrderEditor value={typeOrderForm} labels={TYPE_ORDER_LABELS} onChange={setTypeOrderForm} />
       </SettingsSection>
-
-      <SettingsSection title="點名排列順序" open={openAttendanceOrder} onToggle={() => setOpenAttendanceOrder((v) => !v)} onSubmit={saveAttendanceOrder}>
-        <TypeOrderEditor value={attendanceOrderForm} onChange={setAttendanceOrderForm} />
+    ),
+    attendanceOrder: (
+      <SettingsSection title={SECTION_TITLES.attendanceOrder} open={openAttendanceOrder} onToggle={() => setOpenAttendanceOrder((v) => !v)} onSubmit={saveAttendanceOrder}>
+        <DragOrderEditor value={attendanceOrderForm} labels={TYPE_ORDER_LABELS} onChange={setAttendanceOrderForm} />
       </SettingsSection>
-
-      <h3 style={{ marginBottom: 4, color: 'var(--text-muted)', fontSize: 14, fontWeight: 600, letterSpacing: 1 }}>收費與科目</h3>
-
-      <SettingsSection title="學費預設金額" open={openTuition} onToggle={() => setOpenTuition((v) => !v)} onSubmit={saveTuition}>
+    ),
+    tuition: (
+      <SettingsSection title={SECTION_TITLES.tuition} open={openTuition} onToggle={() => setOpenTuition((v) => !v)} onSubmit={saveTuition}>
         <label>
           1~6 年級
           <input type="number" value={tuitionForm.default_price_grade_1_6} onChange={(e) => setTuitionForm({ ...tuitionForm, default_price_grade_1_6: e.target.value })} />
@@ -365,32 +428,73 @@ export default function Settings() {
           <input type="number" value={tuitionForm.default_price_grade_10_12} onChange={(e) => setTuitionForm({ ...tuitionForm, default_price_grade_10_12: e.target.value })} />
         </label>
       </SettingsSection>
+    ),
+    subjects: (
+      <SettingsSection title={SECTION_TITLES.subjects} open={openSubjects} onToggle={() => setOpenSubjects((v) => !v)}>
+        {subjects.map((s) => (
+          <div key={s} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span>{s}</span>
+            <button type="button" onClick={() => removeSubject(s)}>刪除</button>
+          </div>
+        ))}
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input
+            value={newSubject}
+            onChange={(e) => setNewSubject(e.target.value)}
+            placeholder="新增科目"
+            style={{ flex: 1 }}
+          />
+          <button type="button" onClick={addSubject}>新增</button>
+        </div>
+        <div><button type="button" onClick={resetSubjects}>恢復預設</button></div>
+      </SettingsSection>
+    ),
+  };
 
-      <div style={{ borderBottom: '1px solid var(--border)', paddingBottom: 12, marginBottom: 12 }}>
-        <button type="button" onClick={() => setOpenSubjects((v) => !v)} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          科目選單設定 {openSubjects ? '▲' : '▼'}
-        </button>
-        {openSubjects && (
-          <div style={{ display: 'grid', gap: 6, maxWidth: 320, marginTop: 8 }}>
-            {subjects.map((s) => (
-              <div key={s} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span>{s}</span>
-                <button type="button" onClick={() => removeSubject(s)}>刪除</button>
+  return (
+    <div style={{ maxWidth: 1100, margin: '0 auto' }}>
+      <h2>設定</h2>
+      {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
+
+      {SECTION_CATEGORIES.map(({ title: category, keys }, catIdx) => {
+        const items = sectionOrder.filter((k) => keys.includes(k));
+        return (
+          <div key={category}>
+            <h3
+              style={{
+                marginTop: catIdx === 0 ? 0 : 16,
+                marginBottom: 4,
+                color: 'var(--text-muted)',
+                fontSize: 14,
+                fontWeight: 600,
+                letterSpacing: 1,
+              }}
+            >
+              {category}
+            </h3>
+            {items.map((key, i) => (
+              <div key={key} style={{ display: 'flex', gap: 6, alignItems: 'flex-start' }}>
+                <span
+                  draggable
+                  onDragStart={() => setDragSection({ category, index: i })}
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    if (dragSection?.category === category) reorderSectionsWithinCategory(category, dragSection.index, i);
+                    setDragSection(null);
+                  }}
+                  onDragEnd={() => setDragSection(null)}
+                  title="拖曳調整這個設定區塊的順序（僅限同分類內）"
+                  style={{ cursor: 'grab', color: 'var(--text-muted)', padding: '10px 2px 0 0', flexShrink: 0 }}
+                >
+                  ⠿
+                </span>
+                <div style={{ flex: 1 }}>{sectionRenderers[key]}</div>
               </div>
             ))}
-            <div style={{ display: 'flex', gap: 8 }}>
-              <input
-                value={newSubject}
-                onChange={(e) => setNewSubject(e.target.value)}
-                placeholder="新增科目"
-                style={{ flex: 1 }}
-              />
-              <button type="button" onClick={addSubject}>新增</button>
-            </div>
-            <div><button type="button" onClick={resetSubjects}>恢復預設</button></div>
           </div>
-        )}
-      </div>
+        );
+      })}
     </div>
   );
 }

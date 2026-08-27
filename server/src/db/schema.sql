@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS schools (
   schedule_type_order TEXT NOT NULL DEFAULT '["extra","makeup","regular"]',
   -- 點名子系統同一時段內，固定課/加課/調課的排列順序，邏輯與 schedule_type_order 相同，但獨立設定
   attendance_type_order TEXT NOT NULL DEFAULT '["extra","makeup","regular"]',
+  -- 「設定」頁面本身各設定區塊的顯示順序（JSON 字串陣列，存區塊 key），可在設定頁拖曳調整；
+  -- 陣列裡有未知/缺少的 key 時，前端會自動過濾掉不存在的、把新增的區塊補到最後，不需要每次改版都手動遷移
+  settings_section_order TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

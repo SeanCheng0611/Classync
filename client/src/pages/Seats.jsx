@@ -4,6 +4,7 @@ import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
 import { subscribeSchool } from '../socket';
 import { todayStr, timeToSlot, slotRangeLabel } from '../lib/time';
+import { DEFAULT_SEAT_SORT_ORDER, compareSessionsBySeatOrder, groupSessionsByTeacher } from '../lib/seatSort';
 import TimeInput from '../components/TimeInput';
 
 // 座位版面預設值（新補習班或還沒載入時使用），實際版面存在 school.seat_layout，可透過拖曳調整、新增座位
@@ -264,6 +265,26 @@ export default function Seats() {
       loadSeats();
     } catch (err) {
       setError(err.message);
+    }
+  };
+
+  // 一鍵清空這天「所有」桌子、所有時段的排課資料，方便打掉重練後用「自動排座位」重排一次
+  const clearAllSeats = async () => {
+    if (!confirm('確定要清空這天所有已排的座位嗎？此動作無法復原。')) return;
+    setError('');
+    try {
+      for (const b of blocks) {
+        const blockSeats = seatsByBlock[b.key] || [];
+        for (const seat of blockSeats) {
+          if (seat.teacher_id || seat.students.length > 0) {
+            await api.del(`/api/schools/${currentSchoolId}/seats/${seat.seat_number}?date=${date}&time_slot=${timeToSlot(b.start)}`);
+          }
+        }
+      }
+      loadSeats();
+    } catch (err) {
+      setError(err.message);
+      loadSeats();
     }
   };
 
@@ -560,12 +581,13 @@ export default function Seats() {
     }
   };
 
-  // 上課資訊：列出當日全部有學生、且「尚未排好座位」的課堂，依教師姓名、時間排序；已經排好座位的課堂改到下方「已排座位清單」顯示，這裡就不重複列了
-  const daySessions = sessions
-    .filter((s) => s.students.length > 0)
-    .filter((s) => !findAssignedBlock(s))
-    .slice()
-    .sort((a, b) => teacherName(a.teacher_id).localeCompare(teacherName(b.teacher_id)) || a.start_slot - b.start_slot);
+  // 上課資訊：列出當日全部有學生、且「尚未排好座位」的課堂，依開始時間/結束時間/教師名/學生名排序；
+  // 同一位教師若有兩堂課，強制排在相鄰兩列，方便對照同一位教師的兩個時段。已經排好座位的課堂改到下方「已排座位清單」顯示，這裡就不重複列了
+  const seatSortComparator = compareSessionsBySeatOrder(DEFAULT_SEAT_SORT_ORDER, teacherName);
+  const daySessions = groupSessionsByTeacher(
+    sessions.filter((s) => s.students.length > 0).filter((s) => !findAssignedBlock(s)),
+    seatSortComparator
+  );
 
   // 已排座位清單：跟「上課資訊」相反，只列出已經排好座位的課堂，欄位跟「上課資訊」一致方便對照
   const seatedSessions = sessions
@@ -587,16 +609,17 @@ export default function Seats() {
             <option value="single">單時段</option>
             <option value="double">雙時段</option>
           </select>
-          {isAdmin && <button onClick={autoAssignSeats}>自動排座位</button>}
-          {isAdmin && <button onClick={addSeat}>+ 新增座位</button>}
+          {isAdmin && <button title="清空座位" onClick={clearAllSeats}>清空座位</button>}
+          {isAdmin && <button onClick={autoAssignSeats}>自動座位</button>}
+          {isAdmin && <button title="新增座位" onClick={addSeat}>+</button>}
           {isAdmin && (
-            <button onClick={() => setDeleteSeatMode((v) => !v)}>
-              {deleteSeatMode ? '結束刪除模式' : '- 刪除座位'}
+            <button title="刪除座位" onClick={() => setDeleteSeatMode((v) => !v)}>
+              {deleteSeatMode ? '結束刪除模式' : '-'}
             </button>
           )}
           {isAdmin && (
             <button disabled={exporting} onClick={exportSeatChart}>
-              {exporting ? '匯出中...' : '匯出座位表'}
+              {exporting ? '匯出中...' : '匯出座位'}
             </button>
           )}
         </div>

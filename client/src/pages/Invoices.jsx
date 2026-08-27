@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
 import { subscribeSchool } from '../socket';
@@ -7,6 +7,7 @@ import { subscribeSchool } from '../socket';
 export default function Invoices() {
   const { currentSchoolId, currentMembership } = useAuth();
   const isAdmin = currentMembership?.role === 'admin';
+  const navigate = useNavigate();
 
   const [students, setStudents] = useState([]);
 
@@ -43,7 +44,14 @@ export default function Invoices() {
         </thead>
         <tbody>
           {students.map((s) => (
-            <tr key={s.id} style={{ borderBottom: '1px solid var(--border)' }}>
+            <tr
+              key={s.id}
+              onClick={(e) => {
+                if (e.target.closest('a')) return;
+                navigate(`/invoices/${s.id}`);
+              }}
+              style={{ borderBottom: '1px solid var(--border)', cursor: 'pointer' }}
+            >
               <td><Link to={`/invoices/${s.id}`}>{s.name}</Link></td>
               <td>{s.grade}</td>
               <td>{s.school_name}</td>

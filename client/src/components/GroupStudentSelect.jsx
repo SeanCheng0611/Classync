@@ -13,12 +13,15 @@ function toChineseNumber(n) {
 }
 
 // 一對多排課用：選擇「一對幾」再逐一挑學生＋單堂價錢，上限由「設定」子系統的 group_class_max_students 決定
-export default function GroupStudentSelect({ students, school, maxGroupSize, entries, onChange }) {
+// onFieldComplete 是選用的：填完某個欄位時回報欄位 key（如 `student-0`、`price-0`），
+// 讓外層表單（例如排課彈窗）可以接手把焦點移到下一個欄位，不影響沒有用到這個 prop 的其他呼叫端
+export default function GroupStudentSelect({ students, school, maxGroupSize, entries, onChange, onFieldComplete }) {
   const groupSize = entries.length || 1;
 
   const setGroupSize = (size) => {
     const next = Array.from({ length: size }, (_, i) => entries[i] || { student_id: '', unit_price: 0 });
     onChange(next);
+    onFieldComplete?.('group-size');
   };
 
   const setEntry = (idx, patch) => {
@@ -30,12 +33,13 @@ export default function GroupStudentSelect({ students, school, maxGroupSize, ent
   const pickStudent = (idx, studentId) => {
     const student = students.find((s) => s.id === studentId);
     setEntry(idx, { student_id: studentId, unit_price: student ? defaultPriceForGrade(school, student.grade) : 0 });
+    onFieldComplete?.(`student-${idx}`);
   };
 
   return (
     <div style={{ display: 'grid', gap: 8 }}>
-      <label>
-        班級人數（一對N，上限一對{toChineseNumber(maxGroupSize)}）
+      <label data-field="group-size">
+        班級人數
         <select value={groupSize} onChange={(e) => setGroupSize(Number(e.target.value))}>
           {Array.from({ length: maxGroupSize }, (_, i) => i + 1).map((n) => (
             <option key={n} value={n}>一對{toChineseNumber(n)}</option>
@@ -47,8 +51,8 @@ export default function GroupStudentSelect({ students, school, maxGroupSize, ent
         const options = students.filter((s) => !chosenElsewhere.includes(s.id));
         return (
           <div key={idx} style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
-            <label style={{ flex: 1 }}>
-              學生 {idx + 1}
+            <label style={{ flex: 1 }} data-field={`student-${idx}`}>
+              {entries.length > 1 ? `學生 ${idx + 1}` : '學生'}
               <SearchSelect
                 options={options}
                 value={entry.student_id}
@@ -56,12 +60,17 @@ export default function GroupStudentSelect({ students, school, maxGroupSize, ent
                 placeholder="姓名搜尋..."
               />
             </label>
-            <label>
+            <label data-field={`price-${idx}`}>
               單堂價錢
               <input
                 type="number"
                 value={entry.unit_price}
                 onChange={(e) => setEntry(idx, { unit_price: Number(e.target.value) || 0 })}
+                onKeyDown={(e) => {
+                  if (e.key !== 'Enter') return;
+                  e.preventDefault();
+                  onFieldComplete?.(`price-${idx}`);
+                }}
                 style={{ width: 90 }}
               />
             </label>

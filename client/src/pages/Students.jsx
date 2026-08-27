@@ -14,6 +14,7 @@ import { saveWorkbookAs, applyExportStyle } from '../lib/excelExport';
 import { todayStr, WEEKDAY_LABELS, slotRangeLabel } from '../lib/time';
 import { useSubjectMapping } from '../hooks/useSubjectMapping';
 import { parseSubjects } from '../lib/subjects';
+import { useAutoFocusSearch } from '../lib/useAutoFocusSearch';
 
 const GRADES = Array.from({ length: 12 }, (_, i) => i + 1);
 
@@ -28,6 +29,7 @@ export default function Students() {
   const [students, setStudents] = useState([]);
   const [templates, setTemplates] = useState([]);
   const [search, setSearch] = useState('');
+  const searchInputRef = useAutoFocusSearch();
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState(emptyForm);
   const [error, setError] = useState('');
@@ -412,6 +414,7 @@ export default function Students() {
       {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
 
       <input
+        ref={searchInputRef}
         type="text"
         placeholder="搜尋姓名..."
         value={search}

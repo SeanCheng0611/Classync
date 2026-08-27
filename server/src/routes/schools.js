@@ -227,6 +227,34 @@ schoolsRouter.put('/:schoolId/attendance-type-order', (req, res) => {
   res.json({ ...db.prepare('SELECT * FROM schools WHERE id = ?').get(req.params.schoolId), role: membership.role });
 });
 
+// 「設定」頁面本身各設定區塊的顯示順序：只驗證是「不重複的非空字串陣列」，不比對固定清單——
+// 區塊的 key 集合會隨程式改版增減，前端 parseSectionOrder 已經會過濾掉不存在的 key、把新出現的補到最後，
+// 這裡沒必要跟前端維護同一份清單造成兩邊要同步更新的負擔
+schoolsRouter.put('/:schoolId/settings-section-order', (req, res) => {
+  const membership = getMembership(req.user.id, req.params.schoolId);
+  if (!membership || membership.role !== 'admin') return res.status(403).json({ error: 'admin only' });
+
+  const school = db.prepare('SELECT * FROM schools WHERE id = ?').get(req.params.schoolId);
+  if (!school) return res.status(404).json({ error: 'not found' });
+
+  const { settings_section_order } = req.body;
+  const valid =
+    Array.isArray(settings_section_order) &&
+    settings_section_order.every((k) => typeof k === 'string' && k) &&
+    new Set(settings_section_order).size === settings_section_order.length;
+  if (!valid) {
+    return res.status(400).json({ error: 'settings_section_order 必須是不重複的非空字串陣列' });
+  }
+
+  db.prepare('UPDATE schools SET settings_section_order = ? WHERE id = ?').run(
+    JSON.stringify(settings_section_order),
+    req.params.schoolId
+  );
+
+  broadcastChange(req.params.schoolId, 'scheduling-settings');
+  res.json({ ...db.prepare('SELECT * FROM schools WHERE id = ?').get(req.params.schoolId), role: membership.role });
+});
+
 // 座位系統版面（座位排列位置）：admin/front_desk 皆可調整，layout 是二維陣列，每個內層陣列（一橫排）最多 4 個座位編號
 schoolsRouter.put('/:schoolId/seat-layout', (req, res) => {
   const membership = getMembership(req.user.id, req.params.schoolId);

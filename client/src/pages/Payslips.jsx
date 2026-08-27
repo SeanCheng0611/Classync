@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
 import { subscribeSchool } from '../socket';
@@ -7,6 +7,7 @@ import { subscribeSchool } from '../socket';
 export default function Payslips() {
   const { currentSchoolId, currentMembership } = useAuth();
   const isAdmin = currentMembership?.role === 'admin';
+  const navigate = useNavigate();
 
   const [teachers, setTeachers] = useState([]);
 
@@ -41,7 +42,14 @@ export default function Payslips() {
         </thead>
         <tbody>
           {teachers.map((t) => (
-            <tr key={t.id} style={{ borderBottom: '1px solid var(--border)' }}>
+            <tr
+              key={t.id}
+              onClick={(e) => {
+                if (e.target.closest('a')) return;
+                navigate(`/payslips/${t.id}`);
+              }}
+              style={{ borderBottom: '1px solid var(--border)', cursor: 'pointer' }}
+            >
               <td><Link to={`/payslips/${t.id}`}>{t.name}</Link></td>
               <td>{(t.subjects || []).join('、')}</td>
             </tr>
