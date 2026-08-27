@@ -1,8 +1,8 @@
 import { Router } from 'express';
-import { db } from '../db/index.js';
+import { trashRepository } from '../repositories/index.js';
 import { requireMembership } from '../auth/middleware.js';
 import { broadcastChange } from '../realtime/index.js';
-import { restoreEntity } from '../services/trash.js';
+import { restoreTrashEntry } from '../services/trash.js';
 
 export const trashRouter = Router({ mergeParams: true });
 // 回收桶匯集所有刪除操作（含只有管理者能看的財務資料如繳費單/收支明細），統一僅開放管理者查看與復原
@@ -29,13 +29,7 @@ const AFFECTED_RESOURCES = {
 trashRouter.get('/', (req, res) => {
   const types = req.query.types ? String(req.query.types).split(',').filter(Boolean) : null;
   const { student_id, teacher_id } = req.query;
-  const rows = db
-    .prepare(
-      `SELECT t.*, u.display_name as deleted_by_name FROM trash t
-       LEFT JOIN users u ON u.id = t.deleted_by
-       WHERE t.school_id = ? ORDER BY t.deleted_at DESC`
-    )
-    .all(req.params.schoolId);
+  const rows = trashRepository.findAllBySchool(req.params.schoolId);
   const filtered = rows.filter((r) => {
     if (types && !types.includes(r.entity_type)) return false;
     if (teacher_id && r.related_teacher_id !== teacher_id) return false;
@@ -45,25 +39,25 @@ trashRouter.get('/', (req, res) => {
   res.json(filtered.map((r) => ({ ...r, payload: undefined })));
 });
 
+// 還原 + 刪掉 trash 這一列是同一個 transaction（見 services/trash.js 的 restoreTrashEntry），
+// 任何一步失敗都會整個回滾，不會出現「還原了一半」的狀態
 trashRouter.post('/:id/restore', (req, res) => {
-  const row = db.prepare('SELECT * FROM trash WHERE id = ? AND school_id = ?').get(req.params.id, req.params.schoolId);
-  if (!row) return res.status(404).json({ error: 'not found' });
-
+  let row;
   try {
-    restoreEntity(row.entity_type, JSON.parse(row.payload));
+    row = restoreTrashEntry(req.params.schoolId, req.params.id);
   } catch (err) {
     return res.status(409).json({ error: '復原失敗，可能是關聯資料已不存在或衝突：' + err.message });
   }
-  db.prepare('DELETE FROM trash WHERE id = ?').run(req.params.id);
+  if (!row) return res.status(404).json({ error: 'not found' });
 
   broadcastChange(req.params.schoolId, 'trash');
   for (const resource of AFFECTED_RESOURCES[row.entity_type] || []) broadcastChange(req.params.schoolId, resource);
   res.status(204).end();
 });
 
-// 永久刪除（清空單筆回收桶項目，不還原）
+// 永久刪除（清空單筆回收桶項目，不還原）：單一資料表單筆 DELETE，本身就是原子操作，不需要額外 transaction
 trashRouter.delete('/:id', (req, res) => {
-  db.prepare('DELETE FROM trash WHERE id = ? AND school_id = ?').run(req.params.id, req.params.schoolId);
+  trashRepository.deleteByIdScoped(req.params.schoolId, req.params.id);
   broadcastChange(req.params.schoolId, 'trash');
   res.status(204).end();
 });

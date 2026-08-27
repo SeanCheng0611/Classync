@@ -37,7 +37,10 @@ Phase 1B 不遷移 PostgreSQL，只記錄。這份文件隨每個 Wave 累積，
 | 手動 table rebuild migration（`CREATE TABLE tmp ... / INSERT ... SELECT / DROP / RENAME`） | `db/index.js` 的 `migrateRoleCheckIncludesFrontDesk`、`migrateSeatNumberUpperBound` | PostgreSQL 可以直接 `ALTER TABLE ... ALTER CONSTRAINT` 或 `DROP CONSTRAINT` + `ADD CONSTRAINT`，不需要整張表重建；Phase 1C 的正式 migration framework 應該用這個簡化寫法 |
 | JSON 存成 `TEXT`，應用層 `JSON.stringify`/`JSON.parse` | 見下方「JSON Columns」 | PostgreSQL 有原生 `JSON`/`JSONB` 型別，可以直接存物件、用 `->`/`->>` 查詢，遷移時可考慮改用 `JSONB`（但這是 schema 層決定，不在 Phase 1B/1C repository 抽離範圍內，需另外評估） |
 | Boolean 用 `INTEGER`（0/1） | 例如 `is_owner`、`cancelled`、`rollover`、`makeup_arranged` | PostgreSQL 有原生 `BOOLEAN`；目前 repository 層有些地方會手動 `!!record.rollover` 轉真正的 boolean 給 API response，這個轉換邏輯遷移後可能可以省略（但要小心 API response shape 不能變） |
-| `nanoid()` 產生 ID（Node.js 端，非 DB） | 各 repository 的 `create()` 呼叫端（目前是 route 層傳入 id，Wave 1 沒有改變這個慣例） | 不受 DB 影響，維持現狀 |
+| `nanoid()` 產生 ID（Node.js 端，非 DB） | 各 repository 的 `create()` 呼叫端（Route 或 Service，見「ID Generation Convention」） | 不受 DB 影響，維持現狀 |
+| `datetime('now', '-N days')` 相對時間運算 | `trash.repository.js` 的 `deleteExpired`（trash retention）、`auditLogs.repository.js` 的 `deleteOlderThan` | PostgreSQL 用 `now() - interval 'N days'`，語法不同但語意等價 |
+| 動態表名字串拼接（`` `SELECT * FROM ${table} WHERE ...` ``） | `trash.repository.js`（見 `docs/PERSISTENCE_INVENTORY.md` 的「Trash Repository 的特殊性」） | PostgreSQL 的 prepared statement 也不能對表名做參數綁定，一樣需要字串拼接；因為表名永遠是程式碼常數（不是使用者輸入），沒有 injection 風險，遷移時可以照搬同樣的寫法，只需要確認每個被拼接的表名在 PostgreSQL schema 裡存在 |
+| `ERR_SQLITE_ERROR` + 錯誤訊息字串比對辨識 constraint 種類 | `services/finance.js` 的 `isDuplicateSessionConstraint`（Wave 4，見 `docs/FINANCE_TRANSACTION_INVENTORY.md` 的 Finance Duplicate Race） | PostgreSQL 的 `pg` client 對 constraint violation 有結構化的 `error.code`（例如 `23505` = unique_violation）與 `error.constraint`（約束名稱），比 SQLite 目前用字串 `includes()` 比對訊息文字更可靠；遷移時建議改用 `error.code === '23505' && error.constraint === '<known constraint name>'`，這是一個遷移時的**改善機會**，不是阻塞項 |
 
 ## ID Generation Convention（現況記錄，Phase 1B 未更動）
 
@@ -46,6 +49,20 @@ Phase 1B 不遷移 PostgreSQL，只記錄。這份文件隨每個 Wave 累積，
 這不是 Phase 1B 建議的理想慣例（理想是 Service 產生），但為了維持 Zero Behavior Change、不在
 Repository 抽離的同時又動 ID 產生時機，Wave 1 刻意保持現狀。之後的 Wave 若要統一慣例，會另外記錄
 決策，不要求一次改完。
+
+**Wave 4 稽核結果（現況記錄，不強行統一）**：`grep -rn "nanoid()" routes/ services/` 顯示目前是
+「ID 產生的位置跟著擁有這段業務邏輯的層走」——多數簡單 CRUD route（`students.js`、`teachers.js`、
+`schools.js`、`notes.js`、`inviteCodes.js`、`scheduleTemplates.js`、`sessions.js`、`seats.js`）仍在
+Route 層產生 ID，跟 Wave 1 記錄的現狀一致；而 Wave 2.1 之後新增的、真正有 orchestration 邏輯的
+Service（`attendance.service.js`、`auditLog.service.js`、`services/finance.js`、`services/auth.js`、
+`services/invites.js`、`services/trash.js`、`services/sessions.js`）則是在 Service 內部產生 ID——
+這不是刻意規劃的規則，而是「程式碼被搬到 Service 層的同時，ID 產生也自然跟著搬」的結果（例如
+Wave 3B 把 invoice/payslip 的建立邏輯整段搬進 `services/finance.js`，原本在 route 裡的
+`const invoiceId = nanoid()` 也就一起搬過去了，不是額外的設計決策）。這是一個**已知的不一致**，
+沒有造成任何行為問題（每個 create 路徑各自維持自己原本的 ID 產生時機，Zero Behavior Change），
+Phase 1B 不強行統一成單一慣例；如果未來要統一，建議方向是「ID 產生跟著 create 操作本身，統一放在
+Service 層（沒有 Service 的簡單 CRUD 則留在 Route）」，但這是留給後續 Phase 的決定，不是本 Wave
+的阻塞項。
 
 ## JSON Columns（現況，Wave 1 涵蓋部分）
 
@@ -219,8 +236,39 @@ Invoice/Payslip 的建立與刪除在 Wave 3B 已經有完整 transaction 保護
   可以直接沿用到 Phase 1C 遷移後的 regression test，不需要重新設計測試策略，只需要把測試從同步呼叫
   改成 `await`。
 
-## 待補充（後續 Wave）
+## Wave 4 — Persistence Boundary 封板
 
-- Wave 4（cross-cutting）：`auth.js`（LINE Login upsert）、`inviteCodes.js`、`notes.js`、`trash.js` 的
-  SQLite 特定行為。
+Wave 4 完成了剩餘 domain（`auth`/`inviteCodes`/`notes`/`trash`/`dev`）的 repository 化，
+`routes`/`services`/`auth`/`middleware` 的直接 SQL 降到 0（見 `docs/PERSISTENCE_INVENTORY.md`）。
+對 PostgreSQL 遷移的影響：
+
+### Trash 的動態表名拼接
+
+見上方 SQLite-specific Constructs Inventory 表格。這是唯一一個遷移後**寫法不會變**的地方
+（PostgreSQL 一樣不支援對表名做 parameter binding），但建議 Phase 1C 順便加一層表名白名單檢查
+（雖然目前所有呼叫端都是常數，多一層防呆不會壞事，且不影響行為）。
+
+### 沒有新的 JSON-as-TEXT 欄位
+
+`notes.categories`、`trash.payload`/`trash.related_student_ids` 都是既有欄位（Wave 1 前就存在的
+schema），Wave 4 只是把讀寫這些欄位的 SQL 搬進 repository，沒有新增欄位、沒有改變 JSON 欄位的
+序列化方式。
+
+### Restore 機制的 transaction 語意
+
+`services/trash.js` 的 `restoreTrashEntry` 是 Wave 4 新增的、涉及「讀取多筆 → 動態插入多張表 →
+刪除一筆」的 transaction，PostgreSQL 化時遵循跟 Wave 3B 的 finance transaction 完全相同的模式
+（見上方 Transaction Assumptions 段落），沒有引入新的遷移複雜度。
+
+### Finance Duplicate Race 的錯誤辨識方式
+
+見上方表格新增的一列：目前用 `err.code === 'ERR_SQLITE_ERROR'` + 訊息字串 `includes()` 比對，
+PostgreSQL 遷移時建議改用結構化的 `error.code`/`error.constraint`（`pg` client 提供），這是遷移時的
+改善機會，記錄在此供 Phase 1C 參考，不在 Wave 4 範圍內處理。
+
+## 待補充（後續 Phase）
+
+- Phase 1C 開始 PostgreSQL 遷移時，逐一驗證本文件記錄的每一項差異（尤其是 Timestamp 格式、
+  Transaction 語意、Unique/FK constraint 錯誤訊息格式）在真實 PostgreSQL 環境下的行為，
+  不能只靠這份文件的記錄就假設遷移會順利。
 - Wave 3B：Invoice/Payslip transaction 化後，補充實際採用的 transaction 設計對 Phase 1C 的影響。

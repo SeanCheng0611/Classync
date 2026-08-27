@@ -173,7 +173,7 @@ transaction；迴圈中途失敗只會留下「部分月份已產生 ledger_entr
 
 | Use case | Transaction owner | Atomic writes | Rollback 驗證 | Audit 時機 | 殘餘風險 |
 |---|---|---|---|---|---|
-| Create Invoice | `financeService.createInvoice` | insertInvoice + insertInvoiceItems | ✅ 失敗注入測試通過 | 僅 commit 後 | 低（UNIQUE race 會變 500 而非 409） |
+| Create Invoice | `financeService.createInvoice` | insertInvoice + insertInvoiceItems | ✅ 失敗注入測試通過 | 僅 commit 後 | 低（Wave 4 已修正 UNIQUE race，見下） |
 | Delete Invoice | `financeService.deleteInvoice` | insertTrashRow + deleteLedger + deleteInvoiceRow | ✅ 失敗注入測試通過 | 僅 commit 後 | 低 |
 | Create Payslip | `financeService.createPayslip` | insertPayslip + insertPayslipItems | ✅ 失敗注入測試通過 | 僅 commit 後 | 低（同 Create Invoice） |
 | Delete Payslip | `financeService.deletePayslip` | insertTrashRow + deleteLedger + deletePayslipRow | ✅ 失敗注入測試通過 | 僅 commit 後 | 低 |
@@ -183,3 +183,32 @@ teacher/session 等最小資料），涵蓋 happy path、驗證期失敗（不�
 強制失敗（monkeypatch repository 方法拋出例外）、重複開立/請假/未來日期等既有業務規則、
 `PRAGMA foreign_key_check`、孤兒 row 檢查、跨 process 重啟後資料持久性驗證，共 19 項全數通過，
 未使用正式的 `server/data/app.db` 或 Docker named volume。
+
+---
+
+## Finance Duplicate Race（Wave 4 修正）
+
+**Previous behavior**：`createInvoice`/`createPayslip` 在寫入前會先 `SELECT` 一次「這堂課是否已開立
+過」，但如果兩個請求同時通過這個檢查、同時進入各自的 transaction，理論上會有一個極窄的 race
+window——第一個請求 commit 後，第二個請求的 `INSERT INTO invoice_items`/`payslip_items` 會撞上
+`session_id` 的 `UNIQUE` constraint 而失敗，transaction 完整 rollback（不會留下孤兒 invoice/payslip，
+Wave 3B 已保證），但這個 SQLite 層級的錯誤原本沒有被辨識，會被當成未知例外往外拋，變成 500 而不是
+使用者預期的 409（「已開立過」）。
+
+**Current behavior**：`services/finance.js` 新增 `isDuplicateSessionConstraint(err, column)`，只精確
+辨識**這一種已知情境**——`err.code === 'ERR_SQLITE_ERROR'` 且錯誤訊息包含
+`UNIQUE constraint failed: invoice_items.session_id`（或 payslip 對應欄位）——才轉成
+`FinanceError(409, '課堂已被搶先開立過繳費單/薪資條，無法重複開立')`；其他任何例外（外鍵錯誤、
+磁碟錯誤、語法錯誤、未知錯誤）維持原樣往外拋，不做「catch 全部 DB error 都當 409」這種事
+（明確遵守「不得把所有 DB error 轉 409」的原則）。
+
+**Test**：因為真實併發競態難以穩定重現，測試改用「直接構造相同 constraint violation path」：
+monkeypatch `financeRepository.hasInvoiceItemForSession` 讓應用層的預先檢查回傳 `false`（模擬兩個
+請求的檢查都在對方 commit 前執行、都通過），但資料庫裡已經有另一筆 `invoice_items` 佔用同一個
+`session_id`，驗證：
+1. `createInvoice` 拋出的例外 `status === 409`，訊息符合預期。
+2. 沒有留下孤兒 invoice row（transaction 完整 rollback）。
+3. 一個不相關的強制失敗（例如空的 `session_ids` 觸發的既有 400 驗證錯誤）不會被誤判成 409——確認
+   `isDuplicateSessionConstraint` 只匹配到精確的已知情境，沒有擴大 catch 範圍。
+
+三項測試全數通過，見 Wave 4 完成報告的 Testing 段落。

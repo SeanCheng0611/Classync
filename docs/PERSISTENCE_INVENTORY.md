@@ -1,7 +1,9 @@
 # Persistence Inventory
 
-Phase 0 建立時是純盤點；Phase 1B 開始逐步把直接 SQL 存取收斂進 `server/src/repositories/`。
-這份文件記錄目前進度，供後續 Wave 與 Phase 1C（PostgreSQL 遷移）對照使用。
+Phase 0 建立時是純盤點；Phase 1B 逐步把直接 SQL 存取收斂進 `server/src/repositories/`，
+Wave 4 完成後 **application layer（routes/services/auth/middleware）直接 SQL = 0**，
+Phase 1B 的 Persistence Boundary 目標達成。這份文件記錄最終狀態，供 Phase 1C（PostgreSQL 遷移）
+與後續 Phase 對照使用。
 
 ## 資料庫實作
 
@@ -13,7 +15,7 @@ Phase 0 建立時是純盤點；Phase 1B 開始逐步把直接 SQL 存取收斂�
 - `DATABASE_PATH` 環境變數可覆蓋預設 DB 位置（Wave 1 新增），方便測試環境用獨立 SQLite 檔案，不影響
   production 預設行為。
 
-## Repository Layer
+## Repository Layer（Phase 1B 完成後全貌）
 
 `server/src/repositories/`，composition root 在 `index.js`（同時轉出 `runInTransaction`，見
 `REPOSITORY_ARCHITECTURE.md` 的 Transaction Boundary 說明）。
@@ -22,57 +24,75 @@ Phase 0 建立時是純盤點；Phase 1B 開始逐步把直接 SQL 存取收斂�
 |---|---|---|
 | `students.repository.js` | `students` | 1 |
 | `teachers.repository.js` | `teachers` | 1 |
-| `schools.repository.js` | `schools` | 1 |
-| `memberships.repository.js` | `memberships`（含 join `users`） | 1 |
-| `users.repository.js` | `users`（最小讀取集合） | 1 |
+| `schools.repository.js` | `schools`（含各項 school-scoped 設定欄位） | 1 / 4 |
+| `memberships.repository.js` | `memberships`（含 join `users`/`schools`） | 1 / 4 |
+| `users.repository.js` | `users`（含 LINE 登入 upsert 需要的讀寫） | 1 / 4 |
 | `scheduling.repository.js` | `schedule_templates`, `template_students`, `class_sessions`, `session_students` | 2 |
 | `attendance.repository.js` | `attendance_records` | 2 |
 | `seats.repository.js` | `seat_assignments`, `seat_students` | 2 |
 | `auditLogs.repository.js` | `audit_logs`（cross-cutting infra，不屬於任何 business domain） | 2.1 |
-| `finance.repository.js` | `ledger_entries`, `invoices`/`invoice_items`, `payslips`/`payslip_items`, `tuition_records`（Wave 3A 唯讀 + Wave 3B 補上細粒度 write 方法） | 3A / 3B |
+| `finance.repository.js` | `ledger_entries`, `invoices`/`invoice_items`, `payslips`/`payslip_items`, `tuition_records` | 3A / 3B |
+| `notes.repository.js` | `notes` | 4 |
+| `inviteCodes.repository.js` | `invite_codes` | 4 |
+| `trash.repository.js` | `trash` + 泛用的跨表 snapshot capture/restore 存取（見下方「Trash Repository 的特殊性」） | 4 |
 
-## 統計方式說明（Wave 2.1 起）
+**Repository-layer SQL 總計（14 個 repository 合計，都是預期合法存在）：136**
+**`db/index.js`（schema/migration infra）：25**
 
-Phase 1B 的 KPI 是 **application-layer（routes/services/auth）的直接 SQL 存取數**，不是 repository
-本身的 SQL 數量（repository 裡的 SQL 是預期、合法存在的，不算「散落」）。
+## 統計方式說明
+
+Phase 1B 的 KPI 是 **application-layer（routes/services/auth/middleware）的直接 SQL 存取數**，不是
+repository 本身的 SQL 數量（repository 裡的 SQL 是預期、合法存在的，不算「散落」）。統計方式固定為
+`grep -c "db\.prepare\|db\.exec"` 逐檔精確計數，排除 `repositories/`、`db/` 兩個目錄。
 
 ```text
-Application-layer direct SQL（routes + services + auth，扣掉 repositories/db）: 46
-Repository-layer SQL（10 個 repository 合計，都是預期合法存在）: 118
-db/index.js（schema/migration infra）: 26
+Application-layer direct SQL（routes + services + auth + middleware）: 0
+Repository-layer SQL（14 個 repository 合計，都是預期合法存在）: 136
+db/index.js（schema/migration infra）: 25
 ```
 
-（Wave 3B 起改用 `grep -c "db\.prepare\|db\.exec"` 逐檔精確計數，取代先前的估算數字；上一輪 Wave 3A
-記錄的 71 是估算值，跟這次的精確重新計算方式不完全一致，這裡改以精確計數為準，往後 Wave 沿用同一方式。）
+## Trash Repository 的特殊性
 
-## 直接存取 db 的檔案（Wave 3B 之後現況，application layer）
+`trash.repository.js` 是唯一一個帶有「泛用、依表名參數化」方法（`findRowsByColumn(table, column,
+value)`、`findRowById(table, id)`、`insertRow(table, row)`）的 repository。這不是 Section 25/74 禁止的
+「Generic Repository」（例如 `find(table, ...)` 給所有 domain 共用），而是 Trash 這個 domain 自己的
+persistence 需求——刪除任何實體前都要把它（與它牽連的子資料）序列化存起來、還原時再逐表插回去，這件事
+本質上就是跨表的。呼叫端（`services/trash.js` 的 `capture*`/`RESTORE_HANDLERS`）永遠傳入寫死在程式碼裡
+的表名/欄位名常數，從未來自使用者輸入，不是 SQL injection 風險，也不會被其他 domain 拿去當通用查詢介面
+使用。詳見 `docs/REPOSITORY_ARCHITECTURE.md` 的 Trash Persistence Boundary 段落。
 
-| 檔案 | 次數 | Domain / 備註 |
+## Wave 4 完成明細
+
+| 檔案 | Wave 3B 後次數 | 去向 |
 |---|---:|---|
-| server/src/services/trash.js | 16 | Wave 4（cross-cutting） |
-| server/src/routes/notes.js | 15 | Wave 4（cross-cutting） |
-| server/src/routes/inviteCodes.js | 7 | Wave 4（cross-cutting，含 memberships insert，需與 memberships.repository 協調） |
-| server/src/routes/auth.js | 4 | Wave 4（cross-cutting，LINE Login upsert） |
-| server/src/routes/trash.js | 3 | Wave 4（cross-cutting） |
-| server/src/routes/dev.js | 1 | 開發用假登入輔助路由，Wave 4 可能整條淘汰 |
+| `services/trash.js` | 16 | 全部移進 `trash.repository.js`；service 層改為呼叫 repository + 一個新的 transaction-owning `restoreTrashEntry`（見下） |
+| `routes/notes.js` | 15 | 全部移進 `notes.repository.js`（含分類批次改寫，repository-local transaction）+ `schoolsRepository.updateRemovedDefaultCategories` |
+| `routes/inviteCodes.js` | 7 | 全部移進 `inviteCodes.repository.js`；`/redeem` 的膜拜 membership+invite 寫入改由新的 `services/invites.js` 用單一 transaction 完成（Wave 4 修正的 atomicity gap，見下） |
+| `routes/auth.js` | 4 | `upsertLineUser` 移進 `services/auth.js`（呼叫 `usersRepository`），`/me` 的 membership+school join 移進 `membershipsRepository.findForUserWithSchool` |
+| `routes/trash.js` | 3 | 全部移進 `trash.repository.js`；還原流程改呼叫 `services/trash.js` 的 `restoreTrashEntry`（transaction-owning，見下） |
+| `routes/dev.js` | 1 | 移進 `schoolsRepository.deleteAll()` |
 
-共 6 個非 infra/repository 檔案、46 處直接 SQL 呼叫。
+**Wave 4 移動：46 → 0**
 
-`server/src/routes/invoices.js`、`server/src/routes/payslips.js` **在 Wave 3B 之後也已經沒有任何**
-直接 SQL——POST（create invoice/payslip + items）與 DELETE（invoice/payslip + ledger + trash）全部改由
-`services/finance.js` 的 `createInvoice`/`deleteInvoice`/`createPayslip`/`deletePayslip` 在單一
-`runInTransaction` 內組合呼叫 `financeRepository` 的細粒度 write 方法完成，見
-`docs/FINANCE_TRANSACTION_INVENTORY.md`。
+## 已修正的 Atomicity Gap（Wave 4 審計中發現）
 
-`server/src/services/finance.js`、`server/src/routes/students.js`、`server/src/routes/finance.js`
-**都已經沒有任何**直接 SQL——Wave 3A 完成前 `finance.js`（route）11 處、`students.js` 4 處直接 SQL
-全部移進 `financeRepository`/`schedulingRepository`。
+1. **Trash Restore 原本不是 atomic**：`routes/trash.js` 的還原流程原本是「呼叫 `restoreEntity`（自己
+   對 `schedule_template` 類型內部包一個 transaction）→ 回到 route 再單獨執行一次
+   `DELETE FROM trash`」，這兩步之間如果第二步失敗，會留下「資料已還原、但 trash 列還在」的不一致
+   （使用者理論上可以對同一筆 trash 再按一次還原，造成重複插入）。Wave 4 移除了 `insertSnapshot`/
+   `schedule_template` handler 自帶的 `runInTransaction`，改由新的 `services/trash.js` 的
+   `restoreTrashEntry(schoolId, trashId)` 把「讀 trash 列 → 依 entity_type 還原 → 刪掉 trash 列」整個
+   包在同一個 transaction 內，任何一步失敗都會完整回滾。已用失敗注入測試驗證（monkeypatch
+   `trashRepository.insertRow` 強制拋出例外，確認樣板沒有被部分插回、trash 列也還在）。
+2. **邀請碼兌換（`/redeem`）原本沒有 transaction**：membership upsert 與 `invite_codes.used_at`
+   標記是兩個獨立的 `db.prepare` 呼叫，中途失敗會留下「membership 已建立但邀請碼還能被重複兌換」或
+   「邀請碼已標記用掉但使用者其實沒加入」的不一致。Wave 4 移進 `services/invites.js` 的
+   `redeemInviteCode`，用一個 `runInTransaction` 包住兩步寫入。已用失敗注入測試驗證。
 
-`server/src/services/attendance.service.js` 使用 `runInTransaction`（從 `repositories/index.js` 轉出）
-組合 `attendanceRepository` 與 `schedulingRepository`，**沒有**任何 `db.prepare`/`db.exec`，屬於允許的
-transaction orchestration 例外（Wave 2.1 已修正，非本 Wave 新增）。
+兩者都不是本 Wave 新增的風險，而是既有程式碼裡原本就存在、隨著這次全面盤點才被發現並修正的缺口——
+修正前後的 API path/method/status code/response shape 完全不變，只是內部多了 transaction 保護。
 
-## Wave 進度
+## Wave 進度（完整歷史）
 
 | Wave | 範圍 | 移動 SQL | 累計剩餘（application-layer） |
 |---|---|---:|---:|
@@ -80,9 +100,9 @@ transaction orchestration 例外（Wave 2.1 已修正，非本 Wave 新增）。
 | Wave 1 | students / teachers / schools / memberships | 76 | 142 |
 | Wave 2 | scheduleTemplates / sessions / seats / attendance | 46 | 96 |
 | Wave 2.1 | Admin Mode + Audit Log infra + attendance transaction ownership 修正 | 2 | 94 |
-| Wave 3A | Finance read models + 低風險 CRUD（ledger、tuition_records）+ students.js/finance.js 殘留清理 | 23（估算） | 71（估算，見上方精確計數說明） |
-| Wave 3B | Invoice/Payslip 跨表 atomic transaction（POST/DELETE 兩個 route 全部改用 service transaction） | 19（精確計數） | 46 |
-| Wave 4（待進行） | auth / inviteCodes / notes / trash / dev | — | — |
+| Wave 3A | Finance read models + 低風險 CRUD（ledger、tuition_records）+ students.js/finance.js 殘留清理 | 23（估算） | 71（估算） |
+| Wave 3B | Invoice/Payslip 跨表 atomic transaction（POST/DELETE 兩個 route 全部改用 service transaction） | 19（精確計數起） | 46 |
+| Wave 4 | auth / inviteCodes / notes / trash / dev 全面清理 + trash/invite atomicity 修正 + finance UNIQUE race 500→409 | 46 | **0** |
 
 Wave 3A 移動明細：`services/finance.js`（全部計算邏輯改呼叫 repository）、`routes/finance.js`
 （ledger CRUD + summary + generate-salary/tuition，11 處全移）、`routes/students.js`
@@ -91,17 +111,16 @@ Wave 3A 移動明細：`services/finance.js`（全部計算邏輯改呼叫 repos
 
 Wave 3B 移動明細：`routes/invoices.js` 的 POST（9 處）與 `routes/payslips.js` 的 POST/DELETE
 （10 處）全部改由 `services/finance.js` 新增的 `createInvoice`/`deleteInvoice`/`createPayslip`/
-`deletePayslip` 取代，這四個 service function 各自用一個 `runInTransaction` 組合呼叫
-`financeRepository` 新增的細粒度 write 方法（`insertInvoice`/`insertInvoiceItems`/
-`deleteInvoiceLedgerEntries`/`deleteInvoiceRow` 及 payslip 對應方法）與 `trash.js` 新增的
-`insertTrashRow`（transaction-safe，不 broadcast）。兩個 route 檔案現在完全不含 `db.prepare`/
-`db.exec`，只呼叫 service + repository。
+`deletePayslip` 取代。
 
-## 目標（Wave 4 完成後）
+## Phase 1B 完成狀態
 
 ```text
-routes: 0（Wave 3B 完成前，invoices.js/payslips.js 仍會各剩個位數 SQL，屬已知且有文件記錄的例外）
-services: 0
-auth: 0
-repositories/db: expected SQL only
+routes:      direct DB access = 0
+services:    direct DB access = 0
+auth:        direct DB access = 0
+middleware:  direct DB access = 0
+repositories/db: expected SQL only（136 + 25）
 ```
+
+見 `docs/REPOSITORY_ARCHITECTURE.md` 的完整架構說明與 Phase 1B 完成報告（本文件底部連結）。

@@ -1,7 +1,5 @@
 import { db } from '../db/index.js';
 
-// 目前只涵蓋 auth/middleware.js 與其他 domain 需要的最小讀取集合；
-// LINE 登入/dev 登入的 upsert 邏輯留在 routes/auth.js，之後處理 auth domain 時再一併搬進來
 export const usersRepository = {
   findById(id) {
     return db.prepare('SELECT * FROM users WHERE id = ?').get(id);
@@ -10,5 +8,23 @@ export const usersRepository = {
   findDisplayNameById(id) {
     const row = db.prepare('SELECT display_name FROM users WHERE id = ?').get(id);
     return row?.display_name || null;
+  },
+
+  findByLineUserId(lineUserId) {
+    return db.prepare('SELECT * FROM users WHERE line_user_id = ?').get(lineUserId);
+  },
+
+  count() {
+    return db.prepare('SELECT COUNT(*) as count FROM users').get().count;
+  },
+
+  create({ id, lineUserId, displayName, pictureUrl, isOwner }) {
+    db.prepare(
+      'INSERT INTO users (id, line_user_id, display_name, picture_url, is_owner) VALUES (?, ?, ?, ?, ?)'
+    ).run(id, lineUserId, displayName, pictureUrl, isOwner ? 1 : 0);
+  },
+
+  updateProfile(id, { displayName, pictureUrl }) {
+    db.prepare('UPDATE users SET display_name = ?, picture_url = ? WHERE id = ?').run(displayName, pictureUrl, id);
   },
 };

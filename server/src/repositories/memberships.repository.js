@@ -5,6 +5,17 @@ export const membershipsRepository = {
     return db.prepare('SELECT * FROM memberships WHERE user_id = ? AND school_id = ?').get(userId, schoolId);
   },
 
+  // 該使用者的所有 membership，附帶補習班名稱（/auth/me 用）
+  findForUserWithSchool(userId) {
+    return db
+      .prepare(
+        `SELECT m.school_id, m.role, m.teacher_id, s.name as school_name
+         FROM memberships m JOIN schools s ON s.id = m.school_id
+         WHERE m.user_id = ?`
+      )
+      .all(userId);
+  },
+
   // 該補習班的成員清單，附帶使用者顯示資訊，依角色/姓名排序
   findMembersWithUser(schoolId) {
     return db

@@ -57,7 +57,15 @@ export const schoolsRepository = {
     db.prepare('UPDATE schools SET seat_layout = ? WHERE id = ?').run(JSON.stringify(layout), id);
   },
 
+  updateRemovedDefaultCategories(id, list) {
+    db.prepare('UPDATE schools SET removed_default_categories = ? WHERE id = ?').run(JSON.stringify(list), id);
+  },
+
   delete(id) {
     db.prepare('DELETE FROM schools WHERE id = ?').run(id);
+  },
+
+  deleteAll() {
+    db.prepare('DELETE FROM schools').run();
   },
 };

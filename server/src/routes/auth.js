@@ -1,9 +1,10 @@
 import { Router } from 'express';
 import { nanoid } from 'nanoid';
-import { db } from '../db/index.js';
+import { membershipsRepository } from '../repositories/index.js';
 import { requireAuth } from '../auth/middleware.js';
 import { SESSION_COOKIE, verifySession, setSessionCookie, clearSessionCookie } from '../auth/session.js';
 import { clearAdminSessionCookie } from '../auth/adminSession.js';
+import { upsertLineUser } from '../services/auth.js';
 import { logEvent } from '../services/auditLog.service.js';
 import { PAGE_KEYS } from '../constants/pageKeys.js';
 
@@ -15,25 +16,6 @@ const REDIRECT_COOKIE = 'line_oauth_redirect';
 
 function allowedOrigins() {
   return (process.env.CLIENT_URL || 'http://localhost:5173').split(',').map((s) => s.trim()).filter(Boolean);
-}
-
-function upsertLineUser({ line_user_id, display_name, picture_url }) {
-  const existing = db.prepare('SELECT * FROM users WHERE line_user_id = ?').get(line_user_id);
-  if (existing) {
-    db.prepare('UPDATE users SET display_name = ?, picture_url = ? WHERE id = ?').run(
-      display_name,
-      picture_url,
-      existing.id
-    );
-    return existing.id;
-  }
-  const id = nanoid();
-  const { count } = db.prepare('SELECT COUNT(*) as count FROM users').get();
-  const isOwner = count === 0 ? 1 : 0; // 系統第一位登入者自動成為最高權限者
-  db.prepare(
-    'INSERT INTO users (id, line_user_id, display_name, picture_url, is_owner) VALUES (?, ?, ?, ?, ?)'
-  ).run(id, line_user_id, display_name, picture_url, isOwner);
-  return id;
 }
 
 // --- LINE Login ---
@@ -132,13 +114,7 @@ authRouter.post('/dev/login', (req, res) => {
 });
 
 authRouter.get('/me', requireAuth, (req, res) => {
-  const memberships = db
-    .prepare(
-      `SELECT m.school_id, m.role, m.teacher_id, s.name as school_name
-       FROM memberships m JOIN schools s ON s.id = m.school_id
-       WHERE m.user_id = ?`
-    )
-    .all(req.user.id);
+  const memberships = membershipsRepository.findForUserWithSchool(req.user.id);
 
   res.json({
     user: {

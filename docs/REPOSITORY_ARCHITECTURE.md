@@ -9,10 +9,11 @@ Phase 1B 引入的 Persistence Boundary 說明。目標：Application Logic 只�
 Route → Service → Repository → DB
 ```
 
-- Route、Service、`auth/` 不得 `import { db } from '../db/index.js'`，也不得 `db.prepare(...)` / `db.exec(...)`。
+- Route、Service、`auth/`、`middleware` 不得 `import { db } from '../db/index.js'`，也不得
+  `db.prepare(...)` / `db.exec(...)`。
 - 唯一例外：`db/` 本身（schema 建置、migration）與 `repositories/` 本身。
-- 目前尚未完成全部 domain（見 `docs/PERSISTENCE_INVENTORY.md` 的 Wave 進度），未搬遷的檔案暫時仍直接使用 `db`，
-  這是明確記錄的技術債，不是默默保留。
+- **Wave 4 完成後這條規則沒有任何例外**：`routes/`、`services/`、`auth/` 全部檔案都已經確認過
+  `grep -rn "db\.prepare\|db\.exec"` 為零。見 `docs/PERSISTENCE_INVENTORY.md` 的完整 Wave 進度。
 
 ## Repository Responsibilities
 
@@ -36,9 +37,11 @@ studentsRepository.delete(schoolId, id)
 
 ## Service Responsibilities
 
-- Business rule、計算、跨 repository 的 orchestration（例如 Wave 2 之後的 `SessionService`）。
-- 目前 `services/` 內尚未完成 repository 化的部分（`trash.js`、`finance.js`、`sessions.js`、`conflicts.js`）
-  仍直接使用 `db`，屬於 Wave 2/3/4 待辦。
+- Business rule、計算、跨 repository 的 orchestration（例如 `services/sessions.js`、`services/finance.js`、
+  `services/trash.js`、`services/invites.js`）。
+- Wave 4 完成後 `services/` 內所有檔案都不再直接使用 `db`，全部改呼叫 repository。
+- **不是每個 domain 都需要一個 Service 檔案**：簡單 CRUD（例如 `notes`）允許 Route 直接呼叫
+  Repository，見下方「No Fake Service Layer」。
 
 ## Route Responsibilities
 
@@ -82,18 +85,17 @@ repository 之外的 service（`trash.js`）」的 use case，見下方「Financ
 2. PostgreSQL 的語意（例如 `RETURNING`、async client）跟 SQLite 不同，generic CRUD 包裝反而會把
    底層差異隱性洩漏到呼叫端，Phase 1C 遷移時更難處理。
 
-## 現況（Wave 3B 完成後）
+## 現況（Wave 4 完成後 — Phase 1B 封板狀態）
 
-已完成 repository 化：`students`、`teachers`、`schools`、`memberships`、`users`（Wave 1），
-`scheduling`（`schedule_templates`/`template_students`/`class_sessions`/`session_students`）、
+已完成 repository 化，涵蓋所有 domain：`students`、`teachers`、`schools`、`memberships`、`users`
+（Wave 1），`scheduling`（`schedule_templates`/`template_students`/`class_sessions`/`session_students`）、
 `attendance`、`seats`（Wave 2），`auditLogs`（Wave 2.1），`finance`（`ledger_entries`、
-`tuition_records` 完整 CRUD；`invoices`/`payslips` 唯讀 + Wave 3B 補上的細粒度 write 方法）。
+`tuition_records`、`invoices`/`invoice_items`、`payslips`/`payslip_items`，Wave 3A + 3B），`notes`、
+`inviteCodes`、`trash`（Wave 4）。
 
-`routes/invoices.js`、`routes/payslips.js` 在 Wave 3B 之後**完全不含**直接 SQL，POST/DELETE 都改呼叫
-`services/finance.js` 的 transaction-owning function。
-
-尚未完成（見 `docs/PERSISTENCE_INVENTORY.md`）：cross-cutting（`auth`/`inviteCodes`/`notes`/`trash`，
-Wave 4）。
+**`routes/`、`services/`、`auth/`、middleware 全部不含直接 SQL**——`grep -rn "db\.prepare\|db\.exec"`
+在這四個目錄下回傳 0 筆。Phase 1B 的 Persistence Boundary 目標達成，見
+`docs/PERSISTENCE_INVENTORY.md` 的完整統計。
 
 ## Finance Repository（Wave 3A）
 
@@ -245,12 +247,20 @@ Repository（`attendance.repository.js`）只負責 CRUD 與查詢。「先確�
    連結請假紀錄」）：repository method 自己呼叫 `runInTransaction` 包起來，呼叫端只呼叫一個方法。
    例：`schedulingRepository.createTemplate(...)`、`createSessions(...)`、`updateTemplate(...)`、
    `updateSession(...)`。
-2. **橫跨兩個不同 repository 的操作**（例如撤銷點名要同時改 `attendance_records` 與 `class_sessions`）：
-   `runInTransaction` 從 `repositories/index.js` 轉出，呼叫端（route）自己包一個 transaction，組合呼叫
-   兩邊「不自帶 transaction」的方法。目前只有 `routes/attendance.js` 的 DELETE 用到這個模式。
+2. **橫跨兩個不同 repository（或 repository 之外的 service，例如 `trash.js`）的操作**：
+   `runInTransaction` 從 `repositories/index.js` 轉出，由 **Service** 層組合呼叫多個「不自帶
+   transaction」的方法。**Route 不會、也不應該直接呼叫 `runInTransaction`**——Wave 2.1 把
+   `routes/attendance.js` 原本的 route-level transaction 移進 `attendance.service.js`
+   （`revokeAttendance()`），Wave 4 再把 `routes/notes.js` 原本的 route-level transaction
+   （分類刪除的批次改寫）移除，改成 `notesRepository.updateCategoriesBulk()` 的
+   repository-local transaction（見規則 1，這個操作沒有橫跨 repository，符合規則 1 而非規則 2）。
+   Wave 4 完成後全 repo 搜尋 `runInTransaction` 的呼叫端，確認只出現在 `services/*.js` 與
+   `repositories/*.js` 內部，**零個**出現在 `routes/*.js`。
 3. **絕對不要巢狀 `runInTransaction`**：`node:sqlite` 的 `DatabaseSync` 不支援巢狀 `BEGIN`。這是為什麼
    repository 的「複合方法」（例如 `updateTemplate`）內部呼叫的都是不自帶 transaction 的私有 helper
-   （例如模組內部的 `setTemplateStudents`），不是另一個會自己開 transaction 的 public 方法。
+   （例如模組內部的 `setTemplateStudents`），不是另一個會自己開 transaction 的 public 方法。Wave 4
+   對這條規則做過一次全面稽核（見下方「Nested Transaction Audit（Wave 4）」），修正了 Trash Restore
+   原本會造成的巢狀風險。
 
 Wave 2 完成後已經對 rollback 做過實際驗證（見 Wave 2 完成報告），不是只停留在理論設計。
 
@@ -262,3 +272,169 @@ Wave 2 完成後已經對 rollback 做過實際驗證（見 Wave 2 完成報告�
 - Session 的 JSON 欄位目前沒有（`class_sessions`/`schedule_templates` 本身沒有 JSON-as-TEXT 欄位，
   這點跟 Wave 1 的 `schools`/`teachers` 不同，所以 Wave 2 沒有繼承 Wave 1 「JSON deserialize 留在 route」
   的技術債）。
+
+## Trash Persistence Boundary（Wave 4）
+
+```text
+Route (trash.js / notes.js / inviteCodes.js / students.js / teachers.js / schools.js / sessions.js / scheduleTemplates.js / finance 相關 routes)
+  -> addToTrash(...) / insertTrashRow(...)（刪除前）
+  -> restoreTrashEntry(...)（還原時，見下）
+Service (services/trash.js)
+  -> capture*()：依 entity type 決定要抓哪些表、哪些關聯子資料（業務知識，留在 service）
+  -> RESTORE_HANDLERS：依 entity type 決定還原方式（大多數用泛用的 insertSnapshot，
+     少數如 session_cancelled/schedule_template 有客製邏輯）
+  -> restoreTrashEntry(schoolId, trashId)：transaction owner，見下
+Repository (trash.repository.js)
+  -> findRowsByColumn / findRowById / insertRow：依表名/欄位名參數化的泛用讀寫
+  -> trash 表本體的 CRUD（findAllBySchool / findById / insert / deleteById / deleteExpired）
+```
+
+**為什麼 `trash.repository.js` 有參數化的表名而不算 Generic Repository**：見
+`docs/PERSISTENCE_INVENTORY.md` 的「Trash Repository 的特殊性」段落——這是 Trash domain 自己的
+persistence 需求（刪除任何實體前要能存下它與子資料的快照），不是給其他 domain 共用的抽象查詢介面，
+表名/欄位名永遠是程式碼裡的字面值常數。
+
+**Wave 4 修正的 Restore Atomicity Gap**：Wave 4 之前，`routes/trash.js` 的還原流程是「呼叫
+`restoreEntity()`（`schedule_template` 類型自己包一個 `runInTransaction`）→ 回到 route 再單獨執行一次
+`DELETE FROM trash`」——這兩步之間沒有共同的 transaction，第二步失敗會留下「資料已還原、但 trash
+列還在」的不一致。Wave 4 的修正：
+
+1. 移除 `insertSnapshot`/`schedule_template` restore handler 自帶的 `runInTransaction`（避免下一步
+   包出巢狀 transaction）。
+2. 新增 `services/trash.js` 的 `restoreTrashEntry(schoolId, trashId)`，把「讀 trash 列 → 依
+   entity_type 呼叫對應 restore handler → 刪掉這一列 trash」整個包在**同一個** `runInTransaction`
+   內，任何一步失敗都會完整回滾。
+3. `routes/trash.js` 的 restore endpoint 改成只呼叫這一個 service 函式，不再自己組合
+   `restoreEntity` + 單獨的 `DELETE`。
+
+已用失敗注入測試驗證（monkeypatch `trashRepository.insertRow` 讓 `schedule_template` 還原中途拋出
+例外，確認樣板沒有被部分插回、trash 列也還在——見 Wave 4 完成報告）。
+
+**Trash Restore Completeness（誠實記錄，不假裝完整）**：
+- `student`/`teacher`/`note`/`session`/`session_cancelled`/`schedule_template`/`membership`/
+  `invite_code`：用泛用的 `insertSnapshot`（或客製 handler）把 capture 到的所有表原封插回，
+  已用失敗注入測試 + 正常還原測試驗證可以完整還原。
+- `invoice`/`payslip`/`ledger_entry`：同樣使用泛用的 `insertSnapshot`，capture 時已經包含
+  `invoice_items`/`payslip_items`/相關 `ledger_entries`。Wave 4 測試驗證了「乾淨情境」下（對應課堂
+  沒有被其他 invoice/payslip 搶用）可以完整插回三張表。**沒有**驗證、也不宣稱「課堂被搶用」這種
+  edge case 下的還原行為——如果刪除後、還原前，同一堂課被別的 invoice/payslip 開立過，插回會撞上
+  `invoice_items.session_id`/`payslip_items.session_id` 的 `UNIQUE` constraint 而失敗（`restoreTrashEntry`
+  會完整 rollback、回傳 409，不會產生資料損毀，但使用者會看到「復原失敗」）。這不是本 Wave 引入的
+  新行為，是泛用 restore 機制原本就有的邊界，這裡只是第一次明確記錄下來。
+
+## Auth / Invite Persistence（Wave 4）
+
+```text
+Route (auth.js)
+  -> requireAuth（middleware，讀 usersRepository）
+  -> upsertLineUser(...)（LINE/dev 登入共用）
+Service (services/auth.js)
+  -> upsertLineUser：existing user 走 update、新使用者走 create（含「第一位使用者自動成為 owner」規則）
+Repository (users.repository.js)
+  -> findByLineUserId / count / create / updateProfile
+```
+
+```text
+Route (inviteCodes.js: /redeem)
+  -> redeemInviteCode(userId, code)
+Service (services/invites.js)
+  -> 驗證（invite 存在/未使用、school 存在）在 transaction 外完成
+  -> runInTransaction(() => { membership upsert + inviteCodesRepository.markUsed })
+Repository (inviteCodes.repository.js / memberships.repository.js)
+```
+
+**Wave 4 修正的 Redeem Atomicity Gap**：`/redeem` 原本是兩個獨立的 `db.prepare` 呼叫（membership
+upsert、invite 標記已使用），中途失敗會留下「membership 已建立但邀請碼還能被重複兌換」的不一致。
+現在包在同一個 transaction，已用失敗注入測試驗證（monkeypatch `inviteCodesRepository.markUsed` 強制
+拋出例外，確認沒有建立 membership）。
+
+## No Fake Service Layer
+
+`notes.js`、`inviteCodes.js`（除了 `/redeem`）等簡單 CRUD route **直接呼叫 repository**，沒有為了
+「Route → Service → Repository」形式好看而插入一個純轉發、沒有任何邏輯的 Service 函式。這是刻意的：
+一個只做 `return notesRepository.findAllBySchool(...)` 的 `notesService.list(...)` 不會讓程式更容易
+理解，只會多一層要維護的間接呼叫。只有真的有 business logic（驗證規則、跨 repository orchestration、
+transaction 邊界）才落在 Service 層——例如 `services/finance.js`、`services/trash.js`、
+`services/invites.js`、`services/auth.js`、`services/attendance.service.js`。
+
+## Dependency Direction Audit（Wave 4）
+
+搜尋整個 import graph，確認符合：
+
+```text
+route   -> service -> repository -> db     （有 business logic 的 domain）
+route   -> repository -> db                （簡單 CRUD，見上方「No Fake Service Layer」）
+```
+
+且**不存在**：
+
+```text
+repository -> route / HTTP / 前端程式碼
+db         -> service
+```
+
+`repositories/*.js` 只 import `../db/index.js`（取得 `db`/`runInTransaction`）與 node 內建模組，沒有
+任何一個 repository import 了 `routes/`、`services/`、或 client 端程式碼。`db/index.js` 只做 schema
+初始化、legacy migration、`runInTransaction` 原語，沒有任何 business query（見 Section 37 的
+Database Bootstrap Boundary 確認）。
+
+## Phase 1B Final Architecture
+
+```text
+Client
+  │
+  ▼
+Express Routes
+  │
+  ├── simple CRUD ────────────────────────────┐
+  │   (notes, inviteCodes 查詢/建立/刪除等)      │
+  ▼                                            ▼
+Application Services                     Repositories
+  │   (finance, trash, invites, auth,          │
+  │    sessions, conflicts, attendance)        │
+  ▼                                            │
+Business Logic / Transaction Boundary          │
+  │                                            │
+  └──────────────→ Repositories ←──────────────┘
+                        │
+                        ▼
+                  DB Infrastructure (db/index.js)
+                        │
+                        ▼
+                      SQLite
+```
+
+Transaction：
+
+```text
+Service（finance.js / trash.js / invites.js / attendance.service.js）
+  │
+  ▼
+runInTransaction（server/src/db/index.js，經 repositories/index.js 轉出）
+  │
+  ├── Repository A（例如 financeRepository）
+  ├── Repository B（例如 trashRepository，經 insertTrashRow）
+  └── Repository C（如果需要）
+```
+
+Route 不直接使用 `runInTransaction`；有些 Repository 方法（`scheduling.repository.js` 的
+`createTemplate` 等、`notes.repository.js` 的 `updateCategoriesBulk`）自帶 transaction，但僅限於
+「多步驟寫入不橫跨其他 repository」的情況（規則見上方「Transaction Boundary（Wave 2 更新）」）。
+
+## PostgreSQL 遷移時的預期改動範圍
+
+回答 Section 68 的核心問題：「如果明天把 SQLite 換成 PostgreSQL，是否還需要大改 Routes/Services/Auth？」
+
+**不需要。** 主要改動範圍：
+
+- `db/index.js`：換成 `pg` 的 connection pool，`runInTransaction` 改成 async、`BEGIN`/`COMMIT`/
+  `ROLLBACK` 改用借來的 pool client（見 `docs/POSTGRES_MIGRATION_NOTES.md` 的 Transaction Assumptions
+  段落）。
+- `repositories/*.js` 的每個方法：SQL 語法微調（`?` → `$1`/`$2`...、`datetime('now')` → `now()`、
+  `INSERT OR IGNORE` → `ON CONFLICT`，見 `docs/POSTGRES_MIGRATION_NOTES.md` 的完整清單）、簽名加上
+  可選的 `client`/`tx` 參數以支援 transaction 內呼叫。
+- 所有 Route handler 與 Service function：因為底層都是 async，簽名要改成 `async`、呼叫處加 `await`
+  ——這是機械式的改動，不需要重新設計任何一個 use case 的邏輯或驗證規則。
+- **不需要改動**：業務規則本身（計算邏輯、驗證順序、錯誤訊息）、HTTP API 形狀、transaction
+  的組合方式（哪些操作要放進同一個 transaction 這件事，SQLite 版本已經設計對了，PostgreSQL 版本
+  沿用同樣的分組）。

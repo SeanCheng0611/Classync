@@ -17,6 +17,18 @@ export class FinanceError extends Error {
 // Repository 只提供細粒度的單一 SQL 操作，不知道「一次開立繳費單」這個完整流程長怎樣。
 // 這裡負責組合驗證 + runInTransaction 內的多筆寫入，確保 all-or-nothing。
 
+// Wave 4：createInvoice/createPayslip 在寫入前已經先 SELECT 過一次「這堂課是否已開立過」，
+// 但兩個請求同時通過這個檢查、同時進 transaction 的極窄 race window 理論上仍存在——這種情況下
+// 真正擋下重複計費的是 invoice_items.session_id / payslip_items.session_id 的 UNIQUE constraint，
+// SQLite 會讓第二個 transaction 的 INSERT 失敗並完整 rollback（不會留下孤兒 invoice/payslip，
+// Wave 3B 已保證），但這個錯誤原本會被當成未知例外往外拋、變成 500。這裡只精確辨識這一種已知情境
+// （node:sqlite 的 UNIQUE constraint 錯誤、且欄位剛好是這兩個已知的重複計費防線），轉成跟先檢查
+// 路徑一樣的 409；其他任何錯誤（外鍵錯誤、磁碟錯誤、語法錯誤、未知錯誤）維持原樣往外拋，
+// 不做「catch 全部 DB error 都當 409」這種事。
+function isDuplicateSessionConstraint(err, column) {
+  return err?.code === 'ERR_SQLITE_ERROR' && typeof err.message === 'string' && err.message.includes(`UNIQUE constraint failed: ${column}`);
+}
+
 export function createInvoice(schoolId, { studentId, sessionIds, note }) {
   if (!studentId || !Array.isArray(sessionIds) || sessionIds.length === 0) {
     throw new FinanceError(400, 'student_id and session_ids required');
@@ -38,13 +50,20 @@ export function createInvoice(schoolId, { studentId, sessionIds, note }) {
   const total = items.reduce((sum, i) => sum + i.unit_price, 0);
   const invoiceId = nanoid();
 
-  runInTransaction(() => {
-    financeRepository.insertInvoice({ id: invoiceId, schoolId, studentId, totalAmount: total, note: note || null });
-    financeRepository.insertInvoiceItems(
-      invoiceId,
-      items.map((i) => ({ id: nanoid(), sessionId: i.id, unitPrice: i.unit_price }))
-    );
-  });
+  try {
+    runInTransaction(() => {
+      financeRepository.insertInvoice({ id: invoiceId, schoolId, studentId, totalAmount: total, note: note || null });
+      financeRepository.insertInvoiceItems(
+        invoiceId,
+        items.map((i) => ({ id: nanoid(), sessionId: i.id, unitPrice: i.unit_price }))
+      );
+    });
+  } catch (err) {
+    if (isDuplicateSessionConstraint(err, 'invoice_items.session_id')) {
+      throw new FinanceError(409, '課堂已被搶先開立過繳費單，無法重複開立');
+    }
+    throw err;
+  }
 
   return { invoiceId, itemCount: items.length, total, studentName: student.name };
 }
@@ -100,13 +119,20 @@ export function createPayslip(schoolId, { teacherId, sessionIds, note }) {
   const total = items.reduce((sum, i) => sum + i.pay, 0);
   const payslipId = nanoid();
 
-  runInTransaction(() => {
-    financeRepository.insertPayslip({ id: payslipId, schoolId, teacherId, totalAmount: Math.round(total), note: note || null });
-    financeRepository.insertPayslipItems(
-      payslipId,
-      items.map((i) => ({ id: nanoid(), sessionId: i.session_id, hours: i.hours, rate: i.rate, pay: Math.round(i.pay) }))
-    );
-  });
+  try {
+    runInTransaction(() => {
+      financeRepository.insertPayslip({ id: payslipId, schoolId, teacherId, totalAmount: Math.round(total), note: note || null });
+      financeRepository.insertPayslipItems(
+        payslipId,
+        items.map((i) => ({ id: nanoid(), sessionId: i.session_id, hours: i.hours, rate: i.rate, pay: Math.round(i.pay) }))
+      );
+    });
+  } catch (err) {
+    if (isDuplicateSessionConstraint(err, 'payslip_items.session_id')) {
+      throw new FinanceError(409, '課堂已被搶先開立過薪資條，無法重複開立');
+    }
+    throw err;
+  }
 
   return { payslipId, itemCount: items.length, teacherName: teacher.name };
 }

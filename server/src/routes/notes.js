@@ -1,21 +1,12 @@
 import { Router } from 'express';
 import { nanoid } from 'nanoid';
-import { db, runInTransaction } from '../db/index.js';
+import { notesRepository, schoolsRepository } from '../repositories/index.js';
 import { requireMembership } from '../auth/middleware.js';
 import { broadcastChange } from '../realtime/index.js';
 import { addToTrash, captureNote } from '../services/trash.js';
 
 export const notesRouter = Router({ mergeParams: true });
 notesRouter.use(requireMembership(['admin']));
-
-const SELECT_WITH_JOINS = `
-  SELECT n.*, u.display_name as author_name,
-         s.name as related_student_name, t.name as related_teacher_name
-  FROM notes n
-  LEFT JOIN users u ON u.id = n.author_user_id
-  LEFT JOIN students s ON s.id = n.related_student_id
-  LEFT JOIN teachers t ON t.id = n.related_teacher_id
-`;
 
 function parseCategories(raw) {
   try {
@@ -52,8 +43,8 @@ function sortNotes(rows) {
 const DEFAULT_CATEGORIES = ['待辦', '學生', '教師', '生活', '雜項'];
 
 function getRemovedDefaultCategories(schoolId) {
-  const row = db.prepare('SELECT removed_default_categories FROM schools WHERE id = ?').get(schoolId);
-  return parseCategories(row?.removed_default_categories);
+  const school = schoolsRepository.findById(schoolId);
+  return parseCategories(school?.removed_default_categories);
 }
 
 // student_id/teacher_id：篩出跟某位學生/教師連結的記事，供學生/教師詳細頁的「相關記事」區塊使用
@@ -61,22 +52,20 @@ notesRouter.get('/', (req, res) => {
   const { q, student_id, teacher_id } = req.query;
   let rows;
   if (student_id) {
-    rows = db.prepare(`${SELECT_WITH_JOINS} WHERE n.school_id = ? AND n.related_student_id = ?`).all(req.params.schoolId, student_id);
+    rows = notesRepository.findByStudent(req.params.schoolId, student_id);
   } else if (teacher_id) {
-    rows = db.prepare(`${SELECT_WITH_JOINS} WHERE n.school_id = ? AND n.related_teacher_id = ?`).all(req.params.schoolId, teacher_id);
+    rows = notesRepository.findByTeacher(req.params.schoolId, teacher_id);
   } else if (q) {
-    rows = db
-      .prepare(`${SELECT_WITH_JOINS} WHERE n.school_id = ? AND (n.content LIKE ? OR s.name LIKE ? OR t.name LIKE ?)`)
-      .all(req.params.schoolId, `%${q}%`, `%${q}%`, `%${q}%`);
+    rows = notesRepository.search(req.params.schoolId, q);
   } else {
-    rows = db.prepare(`${SELECT_WITH_JOINS} WHERE n.school_id = ?`).all(req.params.schoolId);
+    rows = notesRepository.findAllBySchool(req.params.schoolId);
   }
   res.json(sortNotes(rows));
 });
 
 // 分類清單（供前端下拉/自動完成、篩選使用）：未被刪除的預設分類在前，其餘依使用次數排序
 notesRouter.get('/categories', (req, res) => {
-  const rows = db.prepare('SELECT categories FROM notes WHERE school_id = ?').all(req.params.schoolId);
+  const rows = notesRepository.findRawCategoriesBySchool(req.params.schoolId);
   const counts = new Map();
   for (const row of rows) {
     for (const c of parseCategories(row.categories)) {
@@ -99,29 +88,22 @@ notesRouter.delete('/categories/:name', (req, res) => {
   const name = req.params.name.trim();
   if (!name) return res.status(400).json({ error: 'name required' });
 
-  const rows = db.prepare('SELECT id, categories FROM notes WHERE school_id = ?').all(req.params.schoolId);
-  const update = db.prepare(`UPDATE notes SET categories = ? WHERE id = ?`);
+  // 需要 id 才能寫回，findRawCategoriesBySchool 只回傳 categories 欄位，這裡改抓完整列表
+  const rows = notesRepository.findAllBySchool(req.params.schoolId);
 
   const affected = [];
   for (const row of rows) {
     const current = parseCategories(row.categories);
     if (!current.includes(name)) continue;
     const remaining = current.filter((c) => c !== name);
-    affected.push({ id: row.id, nextCategories: remaining.length > 0 ? remaining : ['未分類'] });
+    affected.push({ id: row.id, categoriesJson: JSON.stringify(remaining.length > 0 ? remaining : ['未分類']) });
   }
-  if (affected.length > 0) {
-    runInTransaction(() => {
-      for (const { id, nextCategories } of affected) update.run(JSON.stringify(nextCategories), id);
-    });
-  }
+  notesRepository.updateCategoriesBulk(affected);
 
   if (DEFAULT_CATEGORIES.includes(name)) {
     const removedDefaults = new Set(getRemovedDefaultCategories(req.params.schoolId));
     removedDefaults.add(name);
-    db.prepare('UPDATE schools SET removed_default_categories = ? WHERE id = ?').run(
-      JSON.stringify([...removedDefaults]),
-      req.params.schoolId
-    );
+    schoolsRepository.updateRemovedDefaultCategories(req.params.schoolId, [...removedDefaults]);
   }
 
   broadcastChange(req.params.schoolId, 'notes');
@@ -135,27 +117,24 @@ notesRouter.post('/', (req, res) => {
   if (nextCategories.length === 0) return res.status(400).json({ error: '請至少選擇一個分類' });
 
   const id = nanoid();
-  db.prepare(
-    `INSERT INTO notes (id, school_id, author_user_id, categories, done, content, note_date, related_student_id, related_teacher_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
+  notesRepository.create({
     id,
-    req.params.schoolId,
-    req.user.id,
-    JSON.stringify(nextCategories),
-    done ? 1 : 0,
-    content.trim(),
-    note_date || new Date().toISOString().slice(0, 10),
-    related_student_id || null,
-    related_teacher_id || null
-  );
+    schoolId: req.params.schoolId,
+    authorUserId: req.user.id,
+    categoriesJson: JSON.stringify(nextCategories),
+    done,
+    content: content.trim(),
+    noteDate: note_date || new Date().toISOString().slice(0, 10),
+    relatedStudentId: related_student_id,
+    relatedTeacherId: related_teacher_id,
+  });
 
   broadcastChange(req.params.schoolId, 'notes');
-  res.status(201).json(serialize(db.prepare(`${SELECT_WITH_JOINS} WHERE n.id = ?`).get(id)));
+  res.status(201).json(serialize(notesRepository.findByIdUnscoped(id)));
 });
 
 notesRouter.put('/:id', (req, res) => {
-  const existing = db.prepare('SELECT * FROM notes WHERE id = ? AND school_id = ?').get(req.params.id, req.params.schoolId);
+  const existing = notesRepository.findById(req.params.schoolId, req.params.id);
   if (!existing) return res.status(404).json({ error: 'not found' });
 
   const {
@@ -170,25 +149,21 @@ notesRouter.put('/:id', (req, res) => {
   const nextCategories = normalizeCategories(categories);
   if (nextCategories.length === 0) return res.status(400).json({ error: '請至少選擇一個分類' });
 
-  db.prepare(
-    `UPDATE notes SET content=?, note_date=?, categories=?, done=?, related_student_id=?, related_teacher_id=?, updated_at=datetime('now')
-     WHERE id = ?`
-  ).run(
-    content.trim(),
-    note_date,
-    JSON.stringify(nextCategories),
-    done ? 1 : 0,
-    related_student_id || null,
-    related_teacher_id || null,
-    req.params.id
-  );
+  notesRepository.update(req.params.id, {
+    content: content.trim(),
+    noteDate: note_date,
+    categoriesJson: JSON.stringify(nextCategories),
+    done,
+    relatedStudentId: related_student_id,
+    relatedTeacherId: related_teacher_id,
+  });
 
   broadcastChange(req.params.schoolId, 'notes');
-  res.json(serialize(db.prepare(`${SELECT_WITH_JOINS} WHERE n.id = ?`).get(req.params.id)));
+  res.json(serialize(notesRepository.findByIdUnscoped(req.params.id)));
 });
 
 notesRouter.delete('/:id', (req, res) => {
-  const existing = db.prepare('SELECT * FROM notes WHERE id = ? AND school_id = ?').get(req.params.id, req.params.schoolId);
+  const existing = notesRepository.findById(req.params.schoolId, req.params.id);
   if (!existing) return res.status(204).end();
 
   const label = existing.content.length > 30 ? `${existing.content.slice(0, 30)}...` : existing.content;
@@ -197,7 +172,7 @@ notesRouter.delete('/:id', (req, res) => {
     teacherId: existing.related_teacher_id || null,
   });
 
-  db.prepare('DELETE FROM notes WHERE id = ? AND school_id = ?').run(req.params.id, req.params.schoolId);
+  notesRepository.delete(req.params.schoolId, req.params.id);
   broadcastChange(req.params.schoolId, 'notes');
   res.status(204).end();
 });
