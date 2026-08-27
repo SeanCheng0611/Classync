@@ -1,4 +1,4 @@
-import { db } from '../db/index.js';
+import { financeRepository, teachersRepository, studentsRepository, schedulingRepository } from '../repositories/index.js';
 
 export function monthRange(month) {
   // month: 'YYYY-MM' -> [第一天, 下個月第一天)
@@ -22,18 +22,6 @@ function gradeBandColumn(grade) {
   return 'rate_grade_10_12';
 }
 
-function sessionStudents(sessionId) {
-  return db
-    .prepare(
-      `SELECT s.id, s.name, s.grade, ar.status as attendance_status, ar.makeup_arranged
-       FROM session_students ss
-       JOIN students s ON s.id = ss.student_id
-       LEFT JOIN attendance_records ar ON ar.session_id = ss.session_id AND ar.person_type = 'student' AND ar.person_id = ss.student_id
-       WHERE ss.session_id = ?`
-    )
-    .all(sessionId);
-}
-
 // 依課程當下的學生年級分佈，決定該堂課適用哪一段時薪；沒有學生（行政課堂）則用行政時薪
 function sessionRateColumn(students) {
   if (students.length === 0) return 'rate_admin';
@@ -48,7 +36,7 @@ function sessionRateColumn(students) {
 // 單一課堂的薪資試算（供 calcTeacherSalary 批次計算，以及薪資條開立時針對個別課堂計算共用）
 // fully_on_leave：這堂課的學生全部已請假/調課（等同這堂課實際上沒有上課），此類課堂不應計入薪資條開立清單
 export function calcSessionPay(teacher, session) {
-  const students = sessionStudents(session.id);
+  const students = financeRepository.findSessionStudentsWithAttendance(session.id);
   const hours = session.duration_slots / 2;
   const rateColumn = sessionRateColumn(students);
   const rate = session.rate_override ?? teacher[rateColumn];
@@ -58,9 +46,7 @@ export function calcSessionPay(teacher, session) {
   // 尚未點名：這堂課有學生，但至少一位還沒有出缺勤紀錄（attendance_status 為空）；開薪資條前應該先點名確認課堂確實發生過
   const notYetMarked = students.length > 0 && students.some((s) => !s.attendance_status);
   const origin =
-    session.type === 'makeup' && session.origin_session_id
-      ? db.prepare('SELECT session_date, start_slot FROM class_sessions WHERE id = ?').get(session.origin_session_id)
-      : null;
+    session.type === 'makeup' && session.origin_session_id ? schedulingRepository.findSessionByIdAny(session.origin_session_id) : null;
   return {
     session_id: session.id,
     session_date: session.session_date,
@@ -84,15 +70,10 @@ export function calcSessionPay(teacher, session) {
 
 // 教師薪資直接依排課／調課／加課（含無學生的行政課堂）計算，不再依賴教師出缺勤點名
 export function calcTeacherSalary(schoolId, teacherId, startDate, endDateExclusive) {
-  const teacher = db.prepare('SELECT * FROM teachers WHERE id = ? AND school_id = ?').get(teacherId, schoolId);
+  const teacher = teachersRepository.findById(schoolId, teacherId);
   if (!teacher) return { total: 0, items: [] };
 
-  const sessions = db
-    .prepare(
-      `SELECT * FROM class_sessions WHERE school_id = ? AND teacher_id = ? AND session_date >= ? AND session_date < ? AND cancelled = 0
-       ORDER BY session_date, start_slot`
-    )
-    .all(schoolId, teacherId, startDate, endDateExclusive);
+  const sessions = schedulingRepository.findSessionsByTeacherAndDateRange(schoolId, teacherId, startDate, endDateExclusive);
 
   const items = sessions.map((session) => calcSessionPay(teacher, session));
   const total = items.reduce((sum, i) => sum + i.pay, 0);
@@ -100,7 +81,7 @@ export function calcTeacherSalary(schoolId, teacherId, startDate, endDateExclusi
 }
 
 export function calcAllTeachersSalary(schoolId, startDate, endDateExclusive) {
-  const teachers = db.prepare('SELECT * FROM teachers WHERE school_id = ?').all(schoolId);
+  const teachers = teachersRepository.findAllBySchool(schoolId);
   return teachers.map((t) => ({
     teacher_id: t.id,
     teacher_name: t.name,
@@ -112,20 +93,10 @@ export function calcAllTeachersSalary(schoolId, startDate, endDateExclusive) {
 // 加總其單堂價錢；固定課堂新增當下不會立刻計入，要點名確定出席才算。
 // 若區間內完全沒有已出席的計價課堂，退回使用學生的次繳費金額（單價）估算。
 export function calcStudentTuition(schoolId, studentId, startDate, endDateExclusive) {
-  const student = db.prepare('SELECT * FROM students WHERE id = ? AND school_id = ?').get(studentId, schoolId);
+  const student = studentsRepository.findById(schoolId, studentId);
   if (!student) return { total: 0, items: [], estimated: false, suggested_unit_price: 0 };
 
-  const items = db
-    .prepare(
-      `SELECT cs.id as session_id, cs.session_date, cs.subject, cs.type, cs.start_slot, cs.duration_slots, ss.unit_price
-       FROM session_students ss
-       JOIN class_sessions cs ON cs.id = ss.session_id
-       JOIN attendance_records ar ON ar.session_id = cs.id AND ar.person_type = 'student' AND ar.person_id = ss.student_id
-       WHERE cs.school_id = ? AND ss.student_id = ? AND cs.session_date >= ? AND cs.session_date < ?
-         AND cs.cancelled = 0 AND ar.status = 'present'
-       ORDER BY cs.session_date, cs.start_slot`
-    )
-    .all(schoolId, studentId, startDate, endDateExclusive);
+  const items = financeRepository.findBillableAttendedSessions(schoolId, studentId, startDate, endDateExclusive);
 
   const priced = items.filter((i) => i.unit_price > 0);
   if (priced.length > 0) {
@@ -158,7 +129,7 @@ export function calcStudentTuition(schoolId, studentId, startDate, endDateExclus
 // 不會憑空幫沒存檔的月份估算新的欠款，只延續已證實（已存檔）的未收金額，避免漏存月份導致舊欠款消失或被灌水。
 function findNearestUnpaidRollover(schoolId, studentId, month, depth) {
   if (depth >= 24) return { amount: 0, gapFound: true };
-  const record = db.prepare('SELECT * FROM tuition_records WHERE student_id = ? AND month = ?').get(studentId, month);
+  const record = financeRepository.findTuitionRecord(studentId, month);
   if (record) {
     const amount = record.rollover && record.actual_amount < record.expected_amount
       ? record.expected_amount - record.actual_amount

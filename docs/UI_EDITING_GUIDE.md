@@ -107,6 +107,15 @@ docker compose restart backend
 
 ⚠️ 這台機器上實測過，Docker 在 Windows 用 bind mount 跑的時候，後端本來設計成「檔案一改就自動重啟」的機制（`node --watch`）不一定會真的觸發，即使 log 看起來完全正常、沒有任何錯誤，資料庫新欄位或新的 API 路由還是有可能沒套用。所以改完後端程式碼，**務必手動跑一次 `docker compose restart backend`**，不要只憑感覺覺得應該有生效。
 
+⚠️ **如果 `docker` 指令顯示「無法辨識」（`CommandNotFoundException`）**：通常是這個 PowerShell 視窗是在剛裝好 Docker Desktop「之前」就開著的，PATH 還沒更新到。兩個辦法：
+
+1. 直接關掉這個視窗，重新開一個新的 PowerShell 再試一次。
+2. 不想關視窗的話，先貼上這行手動刷新 PATH：
+   ```powershell
+   $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
+   ```
+   跑完之後再執行 `docker compose restart backend` 就能認得指令了。
+
 ### 確認真的上線了
 
 ```powershell

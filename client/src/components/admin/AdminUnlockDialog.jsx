@@ -29,11 +29,9 @@ export default function AdminUnlockDialog({ onClose }) {
         position: 'fixed', inset: 0, zIndex: 200, background: 'rgba(0,0,0,0.35)',
         display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
       }}
-      onClick={onClose}
     >
       <form
         onSubmit={submit}
-        onClick={(e) => e.stopPropagation()}
         style={{
           background: 'var(--surface)', border: '1px solid var(--border-strong)', borderRadius: 8,
           boxShadow: 'var(--shadow)', padding: 20, width: 320, maxWidth: '100%', display: 'grid', gap: 10,

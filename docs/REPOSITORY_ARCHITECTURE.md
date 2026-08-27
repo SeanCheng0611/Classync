@@ -79,14 +79,54 @@ transaction abstraction。Wave 3（finance：invoice + items + ledger）預期�
 2. PostgreSQL 的語意（例如 `RETURNING`、async client）跟 SQLite 不同，generic CRUD 包裝反而會把
    底層差異隱性洩漏到呼叫端，Phase 1C 遷移時更難處理。
 
-## 現況（Wave 2.1 完成後）
+## 現況（Wave 3A 完成後）
 
 已完成 repository 化：`students`、`teachers`、`schools`、`memberships`、`users`（Wave 1），
 `scheduling`（`schedule_templates`/`template_students`/`class_sessions`/`session_students`）、
-`attendance`、`seats`（Wave 2），`auditLogs`（Wave 2.1，見下方 AuditLog 段落）。
+`attendance`、`seats`（Wave 2），`auditLogs`（Wave 2.1），`finance`（`ledger_entries`、
+`tuition_records` 完整 CRUD；`invoices`/`payslips` 唯讀，Wave 3A）。
 
-尚未完成（見 `docs/PERSISTENCE_INVENTORY.md`）：finance（`invoices`/`payslips`/`tuition_records`/`ledger_entries`）、
-cross-cutting（`auth`/`inviteCodes`/`notes`/`trash`）。
+尚未完成（見 `docs/PERSISTENCE_INVENTORY.md`）：finance 的 invoice/payslip 建立與刪除（跨表 atomic
+transaction，Wave 3B，詳見 `docs/FINANCE_TRANSACTION_INVENTORY.md`）、cross-cutting
+（`auth`/`inviteCodes`/`notes`/`trash`，Wave 4）。
+
+## Finance Repository（Wave 3A）
+
+`finance.repository.js` 涵蓋 `ledger_entries`、`invoice_items`/`invoices`（唯讀）、
+`payslip_items`/`payslips`（唯讀）、`tuition_records`，理由跟 Wave 2 的
+`scheduling.repository.js` 一樣——這幾張表的讀取高度耦合（收支明細反查繳費單/薪資條明細，
+繳費單/薪資條明細又反查課堂），沒有清楚的單一 aggregate 邊界，強行拆開只會讓呼叫端要協調更多物件。
+
+### Finance Read Boundary
+
+Wave 3A 只處理**讀取查詢**（列表、明細、彙總）與**低風險單表 CRUD**（`ledger_entries`、
+`tuition_records`，兩者都是單一資料表的寫入，沒有跨表 atomicity 疑慮）。`invoices`/`payslips` 的
+建立與刪除因為橫跨兩張表（`invoices`+`invoice_items`、`payslips`+`payslip_items`，刪除還牽涉
+`ledger_entries`），刻意留給 Wave 3B，`routes/invoices.js`、`routes/payslips.js` 的 POST/DELETE
+目前仍直接 `import { db }`——這是**唯一**允許在 Wave 3A 之後的 application-layer 直接 SQL 例外，
+每一處都在檔案裡用註解標明「NOTE（Wave 3A）」並指向 `docs/FINANCE_TRANSACTION_INVENTORY.md`。
+
+### Finance Calculation Ownership
+
+`services/finance.js` 保留所有計算邏輯（薪資試算、學費試算、rollover 計算），完全沒有搬進
+repository——repository 只負責回傳 `rate`、`hours`、`records`、`items` 這些原始資料，`Math.round`、
+年級對應時薪級距、rollover 往回找邏輯等等全部留在 service，這是刻意維持，不是遺漏。
+
+### Read Model Policy
+
+允許 repository 提供「描述查詢意圖」而非「對應單一 Entity CRUD」的 read model 方法，例如
+`findInvoiceableSessionsForStudent`、`findBillableAttendedSessions`、`findLedgerSummaryRows`——
+這些方法內部可以包含 JOIN/GROUP BY/聚合，只要它描述的是「要取得什麼資料」而不是業務規則本身
+（例如「這堂課算不算已收費」的判斷邏輯留在 service/route，repository 只負責照著條件撈資料）。
+
+### Audit Logging Policy（Finance）
+
+Wave 3A 已對 Finance 內實際處理的 mutation 加 log（ledger create/update/delete/generate-salary/
+generate-tuition、invoice.create/delete、payslip.create/delete、tuition_record.upsert/delete）。
+Metadata 只記必要資訊（`item_count`、`total`、`created`/`updated` 筆數），不記錄完整
+invoice/payslip/学生財務檔案物件，遵守 Wave 2.1 建立的 sensitive-data sanitizer 政策。Wave 3B
+的 invoice/payslip create/delete 目前用的還是 Wave 3A 加上去的 log 呼叫，沒有因為 transaction
+還沒重構就跳過 audit。
 
 ## AuditLog Service / Repository（Wave 2.1）
 

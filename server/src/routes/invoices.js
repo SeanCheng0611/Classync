@@ -1,11 +1,14 @@
 import { Router } from 'express';
 import { nanoid } from 'nanoid';
 import { db } from '../db/index.js';
+import { financeRepository, studentsRepository } from '../repositories/index.js';
 import { requireMembership } from '../auth/middleware.js';
 import { broadcastChange } from '../realtime/index.js';
 import { ensureSessionsForRange } from '../services/sessions.js';
 import { monthRange } from '../services/finance.js';
 import { addToTrash, captureInvoice } from '../services/trash.js';
+import { logEvent } from '../services/auditLog.service.js';
+import { PAGE_KEYS } from '../constants/pageKeys.js';
 
 export const invoicesRouter = Router({ mergeParams: true });
 invoicesRouter.use(requireMembership(['admin']));
@@ -15,28 +18,13 @@ invoicesRouter.get('/sessions', (req, res) => {
   const { student_id, month } = req.query;
   if (!student_id || !month) return res.status(400).json({ error: 'student_id and month required' });
 
-  const student = db.prepare('SELECT * FROM students WHERE id = ? AND school_id = ?').get(student_id, req.params.schoolId);
+  const student = studentsRepository.findById(req.params.schoolId, student_id);
   if (!student) return res.status(404).json({ error: 'student not found' });
 
   const [start, end] = monthRange(month);
   ensureSessionsForRange(req.params.schoolId, start, end);
 
-  const rows = db
-    .prepare(
-      `SELECT cs.id as session_id, cs.session_date, cs.start_slot, cs.duration_slots, cs.subject, cs.teacher_id, cs.type,
-              ss.unit_price, ar.status as attendance_status,
-              CASE WHEN ii.id IS NOT NULL THEN 1 ELSE 0 END as invoiced,
-              origin.session_date as origin_session_date, origin.start_slot as origin_start_slot
-       FROM session_students ss
-       JOIN class_sessions cs ON cs.id = ss.session_id
-       LEFT JOIN attendance_records ar ON ar.session_id = cs.id AND ar.person_type = 'student' AND ar.person_id = ss.student_id
-       LEFT JOIN invoice_items ii ON ii.session_id = cs.id
-       LEFT JOIN class_sessions origin ON origin.id = cs.origin_session_id
-       WHERE cs.school_id = ? AND ss.student_id = ? AND cs.session_date >= ? AND cs.session_date < ? AND cs.cancelled = 0
-       ORDER BY cs.session_date, cs.start_slot`
-    )
-    .all(req.params.schoolId, student_id, start, end);
-
+  const rows = financeRepository.findInvoiceableSessionsForStudent(req.params.schoolId, student_id, start, end);
   res.json(rows.map((r) => ({ ...r, invoiced: !!r.invoiced })));
 });
 
@@ -45,17 +33,14 @@ invoicesRouter.get('/', (req, res) => {
   const { student_id } = req.query;
   if (!student_id) return res.status(400).json({ error: 'student_id required' });
 
-  const rows = db
-    .prepare(
-      `SELECT i.*, (SELECT COUNT(*) FROM invoice_items WHERE invoice_id = i.id) as item_count
-       FROM invoices i WHERE i.school_id = ? AND i.student_id = ?
-       ORDER BY i.issued_date DESC, i.created_at DESC`
-    )
-    .all(req.params.schoolId, student_id);
-  res.json(rows);
+  res.json(financeRepository.findInvoicesByStudent(req.params.schoolId, student_id));
 });
 
 // 開立繳費單：從指定的課堂（須為該學生、尚未開立過）挑選建立，可跨月；不論日期到了沒或出缺勤狀態都能開立
+//
+// NOTE（Wave 3A）：這個 endpoint 橫跨 invoices + invoice_items 兩張表寫入，屬於 Wave 3B
+// 「Financial Atomic Transactions」範圍，這次刻意沒有搬進 financeRepository，仍直接用 db——
+// 詳見 docs/FINANCE_TRANSACTION_INVENTORY.md 的「Create Invoice」項目。
 invoicesRouter.post('/', (req, res) => {
   const { student_id, session_ids, note } = req.body;
   if (!student_id || !Array.isArray(session_ids) || session_ids.length === 0) {
@@ -93,28 +78,27 @@ invoicesRouter.post('/', (req, res) => {
   for (const i of items) insertItem.run(nanoid(), invoiceId, i.id, i.unit_price);
 
   broadcastChange(req.params.schoolId, 'finance');
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.INVOICES, action: 'invoice.create',
+    message: `開立繳費單（${student.name}）`, userId: req.user.id, schoolId: req.params.schoolId,
+    entityType: 'invoice', entityId: invoiceId, metadata: { item_count: items.length, total },
+  });
   res.status(201).json(db.prepare('SELECT * FROM invoices WHERE id = ?').get(invoiceId));
 });
 
 // 單張繳費單明細（逐堂課清單）
 invoicesRouter.get('/:id', (req, res) => {
-  const invoice = db.prepare('SELECT * FROM invoices WHERE id = ? AND school_id = ?').get(req.params.id, req.params.schoolId);
+  const invoice = financeRepository.findInvoiceById(req.params.schoolId, req.params.id);
   if (!invoice) return res.status(404).json({ error: 'not found' });
 
-  const items = db
-    .prepare(
-      `SELECT ii.id, ii.unit_price, cs.session_date, cs.subject, cs.type, cs.start_slot, cs.duration_slots, cs.teacher_id,
-              origin.session_date as origin_session_date, origin.start_slot as origin_start_slot
-       FROM invoice_items ii JOIN class_sessions cs ON cs.id = ii.session_id
-       LEFT JOIN class_sessions origin ON origin.id = cs.origin_session_id
-       WHERE ii.invoice_id = ? ORDER BY cs.session_date`
-    )
-    .all(req.params.id);
-
+  const items = financeRepository.findInvoiceItemsWithSession(req.params.id);
   res.json({ ...invoice, items });
 });
 
 // 刪除繳費單：釋放其中的課堂讓它們可以被重新開立，若已產生對應的收支明細也一併刪除
+//
+// NOTE（Wave 3A）：跟 POST 一樣橫跨多表寫入（invoices + ledger_entries，還有 trash capture 的
+// 讀取順序要求），屬於 Wave 3B 範圍，刻意沒有搬進 financeRepository。
 invoicesRouter.delete('/:id', (req, res) => {
   const invoice = db.prepare('SELECT * FROM invoices WHERE id = ? AND school_id = ?').get(req.params.id, req.params.schoolId);
   if (!invoice) return res.status(404).json({ error: 'not found' });
@@ -127,5 +111,10 @@ invoicesRouter.delete('/:id', (req, res) => {
   db.prepare('DELETE FROM invoices WHERE id = ?').run(req.params.id);
 
   broadcastChange(req.params.schoolId, 'finance');
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.INVOICES, action: 'invoice.delete',
+    message: `刪除繳費單「${label}」`, userId: req.user.id, schoolId: req.params.schoolId,
+    entityType: 'invoice', entityId: req.params.id,
+  });
   res.status(204).end();
 });

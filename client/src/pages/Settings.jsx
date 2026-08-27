@@ -476,7 +476,10 @@ export default function Settings() {
 
   return (
     <div style={{ maxWidth: 1100, margin: '0 auto' }}>
-      <h2 onClick={handleTitleTap} style={{ userSelect: 'none', cursor: 'default', display: 'inline-block' }}>
+      <h2
+        onClick={handleTitleTap}
+        style={{ userSelect: 'none', cursor: 'default', display: 'inline-block', padding: '12px 24px 12px 0' }}
+      >
         設定
       </h2>
       {tapCount >= 7 && tapCount < ADMIN_UNLOCK_TAP_TARGET && (

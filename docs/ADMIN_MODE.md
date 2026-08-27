@@ -23,9 +23,33 @@
 
 - `.env` 只存**前綴的 scrypt 雜湊值**（`ADMIN_MODE_PASSWORD_HASH`），不是完整每日密碼、也不是明文。
 - 日期尾碼（MMDD）由 **server 自己的時鐘**計算，不接受任何 client 提供的日期——避免有人操控成
-  「宣稱今天是某一天」來繞過限制。
-- 驗證時把提交的密碼拆成「前綴部分」與「日期尾碼」兩段，日期尾碼用字串比對（本身不是 secret），
+  「宣稱今天是某一天」來繞過限制。Frontend 只會把使用者輸入的完整密碼原封不動送出，不會、也不能
+  自己決定或提交日期。
+- 時區明確指定為 `ADMIN_MODE_TIMEZONE`（預設 `Asia/Taipei`），不依賴 Docker host / OS 的預設時區——
+  container 常常預設跑在 UTC，沒有這個明確指定的話，MMDD 在特定時段會跟台灣使用者認知的「今天」差一天。
+- 驗證前先做格式檢查（`parseAdminPassword`）：長度要夠、最後 4 碼必須是數字，格式不對直接判定失敗，
+  不會浪費資源做 `scrypt` 運算。
+- 格式通過後，把提交的密碼拆成「前綴部分」與「日期尾碼」兩段，日期尾碼用字串比對（本身不是 secret），
   前綴部分用 `scrypt` + `timingSafeEqual` 比對雜湊值（見 `server/src/auth/adminPassword.js`）。
+
+### Security Model 摘要
+
+```text
+10 次點擊       = 隱藏入口的發現方式，不是驗證
+MMDD           = 每日變動因子，由 server 時鐘（Asia/Taipei）產生，不是主要 secret
+固定前綴        = 真正的 secret，只以 scrypt 雜湊儲存
+Admin JWT      = 通過驗證後發出的短效授權憑證，backend 每次請求都會驗證
+```
+
+真正的 security boundary = 固定前綴（雜湊儲存）+ server 產生的 MMDD + rate limiting + backend 驗證
++ 短效 Admin JWT，五者缺一不可。
+
+### 跨午夜行為
+
+Admin unlock 當下才會檢查 MMDD 是否等於「今天」；一旦成功發出 Admin JWT，這個 JWT 就依照自己的
+`ADMIN_MODE_SESSION_MINUTES` 到期時間獨立運作，**不會因為跨過午夜、MMDD 換了一天就提前失效**。
+例如 23:50 用當天的 MMDD 解鎖成功，JWT 會正常持續到 00:35（45 分鐘後）才過期，不會在 00:00 被踢出。
+`requireSystemAdminMode` 只驗證 JWT 本身是否還在效期內，不會每次 request 都重新檢查 MMDD。
 
 ### 產生雜湊值
 
@@ -78,6 +102,14 @@ instance 會各自獨立計數，等於實質上放寬了限制次數。若未�
 見 `server/.env.example`：
 
 ```text
-ADMIN_MODE_PASSWORD_HASH=       # 前綴的 scrypt 雜湊值，留空則整個功能無法使用
-ADMIN_MODE_SESSION_MINUTES=45   # 解鎖後的有效時間
+ADMIN_MODE_PASSWORD_HASH=            # 前綴的 scrypt 雜湊值，留空則整個功能無法使用
+ADMIN_MODE_SESSION_MINUTES=45        # 解鎖後的有效時間
+ADMIN_MODE_TIMEZONE=Asia/Taipei      # MMDD 用哪個時區算，不是 secret
 ```
+
+## Secret 洩漏檢查（Wave 3A）
+
+Wave 3A 開始前掃描過整個 repository（tracked 檔案 + 完整 git history），確認真實的固定前綴、完整每日
+密碼都沒有出現在任何會被 commit 的地方（`git log --all -S "<真實前綴>"` 沒有任何結果）。文件與
+`.env.example` 裡出現的前綴一律是示意用的假值（例如 `ABCDEFGH`），不是任何人實際在用的前綴。
+不需要 rotate，也沒有對 git history 做任何改寫。

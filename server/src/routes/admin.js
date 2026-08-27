@@ -7,20 +7,20 @@ import {
   ADMIN_SESSION_COOKIE,
   ADMIN_SESSION_MINUTES_VALUE,
 } from '../auth/adminSession.js';
-import { verifyAdminPassword, isRateLimited, recordFailedAttempt, clearFailedAttempts, cooldownRemainingMs } from '../auth/adminPassword.js';
+import {
+  verifyAdminPassword,
+  parseAdminPassword,
+  todayMMDD,
+  isRateLimited,
+  recordFailedAttempt,
+  clearFailedAttempts,
+  cooldownRemainingMs,
+} from '../auth/adminPassword.js';
 import { logEvent, findLogs } from '../services/auditLog.service.js';
 import { PAGE_KEY_VALUES } from '../constants/pageKeys.js';
 
 export const adminRouter = Router();
 adminRouter.use(requireAuth);
-
-// server 自己的時鐘算「今天」，不接受任何 client 提供的日期——密碼尾碼要跟這個比對
-function todayMMDD() {
-  const now = new Date();
-  const mm = String(now.getMonth() + 1).padStart(2, '0');
-  const dd = String(now.getDate()).padStart(2, '0');
-  return `${mm}${dd}`;
-}
 
 // 是否已經解鎖過（給前端 refresh 後判斷要不要恢復 Admin Mode UI 用）。這裡用跟
 // requireSystemAdminMode 完全一樣的驗證邏輯，只是不擋 request、只回報結果——實際保護敏感資料的
@@ -53,13 +53,12 @@ adminRouter.post('/unlock', (req, res) => {
     return res.status(500).json({ error: 'ADMIN_MODE_PASSWORD_HASH 尚未設定，管理者模式無法使用' });
   }
   // 密碼是「固定前綴 + 當天日期（MMDD）」，每天自動變動：只有前綴被雜湊儲存，
-  // 日期尾碼一律用 server 自己的時鐘算，不信任任何 client 提供的日期，避免被操控成任何一天都能用。
-  const todaySuffix = todayMMDD();
-  const providedSuffix = typeof password === 'string' ? password.slice(-4) : '';
-  const providedPrefix = typeof password === 'string' ? password.slice(0, -4) : '';
-  const suffixOk = providedSuffix === todaySuffix;
-  const prefixOk = providedPrefix && verifyAdminPassword(providedPrefix, expectedHash);
-  if (!password || !suffixOk || !prefixOk) {
+  // 日期尾碼一律用 server 自己的時鐘（明確指定 ADMIN_MODE_TIMEZONE，預設 Asia/Taipei）算，
+  // 不信任任何 client 提供的日期，避免被操控成任何一天都能用。
+  const parsed = parseAdminPassword(password);
+  const suffixOk = !!parsed && parsed.dateCode === todayMMDD();
+  const prefixOk = !!parsed && verifyAdminPassword(parsed.prefix, expectedHash);
+  if (!parsed || !suffixOk || !prefixOk) {
     recordFailedAttempt(rateLimitKey);
     // 絕對不記錄提交的密碼本身，只記錄「這件事發生了」
     logEvent({

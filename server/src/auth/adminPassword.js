@@ -4,6 +4,30 @@ import { scryptSync, randomBytes, timingSafeEqual } from 'node:crypto';
 // 這裡只是呼叫標準函式庫實作，不是自製加密演算法。格式：`<saltHex>:<hashHex>`。
 const KEY_LENGTH = 64;
 
+const DEFAULT_TIMEZONE = 'Asia/Taipei';
+
+// 密碼尾碼（MMDD）用明確指定的時區算，不依賴 Docker host / OS 的預設時區——host 時區設定錯誤或
+// container 沒特別設定時區時常常是 UTC，會讓密碼尾碼跟台灣使用者認知的「今天」差一天。
+// 用 Intl.DateTimeFormat 搭配 IANA 時區名稱是 Node 內建能力，不需要額外套件（例如 dayjs/luxon）。
+// 接受可選的 `date` 參數（預設現在），方便單元測試獨立驗證這個函式，不用真的等到特定日期才能測。
+export function todayMMDD(timezone = process.env.ADMIN_MODE_TIMEZONE || DEFAULT_TIMEZONE, date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: timezone, month: '2-digit', day: '2-digit' }).formatToParts(date);
+  const mm = parts.find((p) => p.type === 'month').value;
+  const dd = parts.find((p) => p.type === 'day').value;
+  return `${mm}${dd}`;
+}
+
+// 密碼格式驗證：先確認基本形狀合理（長度足夠、尾碼是 4 位數字）再進行 scrypt 運算，
+// 避免對明顯不合法的輸入也做一次昂貴的雜湊計算。不合法回傳 null，呼叫端視同驗證失敗。
+export function parseAdminPassword(password) {
+  if (typeof password !== 'string' || password.length <= 4) return null;
+  const dateCode = password.slice(-4);
+  const prefix = password.slice(0, -4);
+  if (!/^\d{4}$/.test(dateCode)) return null;
+  if (!prefix) return null;
+  return { prefix, dateCode };
+}
+
 export function hashAdminPassword(plainPassword) {
   const salt = randomBytes(16);
   const hash = scryptSync(plainPassword, salt, KEY_LENGTH);

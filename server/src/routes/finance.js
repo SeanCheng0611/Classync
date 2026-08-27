@@ -1,11 +1,13 @@
 import { Router } from 'express';
 import { nanoid } from 'nanoid';
-import { db } from '../db/index.js';
+import { financeRepository } from '../repositories/index.js';
 import { requireMembership } from '../auth/middleware.js';
 import { broadcastChange } from '../realtime/index.js';
 import { calcTeacherSalary, calcAllTeachersSalary, calcStudentTuition, calcStudentTuitionForMonth, monthRange, shiftMonth } from '../services/finance.js';
 import { ensureSessionsForRange } from '../services/sessions.js';
 import { addToTrash, captureLedgerEntry } from '../services/trash.js';
+import { logEvent } from '../services/auditLog.service.js';
+import { PAGE_KEYS } from '../constants/pageKeys.js';
 
 // 財務資料屬敏感資訊，整個模組僅管理者可存取
 export const financeRouter = Router({ mergeParams: true });
@@ -13,35 +15,14 @@ financeRouter.use(requireMembership(['admin']));
 
 financeRouter.get('/ledger', (req, res) => {
   const { start, end, category } = req.query;
-  let sql = 'SELECT * FROM ledger_entries WHERE school_id = ?';
-  const params = [req.params.schoolId];
-  if (start) {
-    sql += ' AND entry_date >= ?';
-    params.push(start);
-  }
-  if (end) {
-    sql += ' AND entry_date < ?';
-    params.push(end);
-  }
-  if (category) {
-    sql += ' AND category = ?';
-    params.push(category);
-  }
-  sql += ' ORDER BY entry_date DESC, created_at DESC';
-  res.json(db.prepare(sql).all(...params));
+  res.json(financeRepository.findLedgerEntries(req.params.schoolId, { start, end, category }));
 });
 
 financeRouter.get('/summary', (req, res) => {
   const { start, end } = req.query;
   if (!start || !end) return res.status(400).json({ error: 'start and end required' });
 
-  const rows = db
-    .prepare(
-      `SELECT entry_type, category, SUM(amount) as total FROM ledger_entries
-       WHERE school_id = ? AND entry_date >= ? AND entry_date < ?
-       GROUP BY entry_type, category`
-    )
-    .all(req.params.schoolId, start, end);
+  const rows = financeRepository.findLedgerSummaryRows(req.params.schoolId, start, end);
 
   const income = rows.filter((r) => r.entry_type === 'income').reduce((s, r) => s + r.total, 0);
   const expense = rows.filter((r) => r.entry_type === 'expense').reduce((s, r) => s + r.total, 0);
@@ -58,36 +39,44 @@ financeRouter.post('/ledger', (req, res) => {
   }
 
   const id = nanoid();
-  db.prepare(
-    `INSERT INTO ledger_entries (id, school_id, entry_type, category, amount, entry_date, related_student_id, related_teacher_id, note)
-     VALUES (?, ?, ?, 'manual', ?, ?, ?, ?, ?)`
-  ).run(id, req.params.schoolId, entry_type, amount, entry_date, related_student_id || null, related_teacher_id || null, note || null);
+  financeRepository.createLedgerEntry({
+    id,
+    schoolId: req.params.schoolId,
+    entryType: entry_type,
+    category: 'manual',
+    amount,
+    entryDate: entry_date,
+    relatedStudentId: related_student_id,
+    relatedTeacherId: related_teacher_id,
+    note,
+  });
 
   broadcastChange(req.params.schoolId, 'finance');
-  res.status(201).json(db.prepare('SELECT * FROM ledger_entries WHERE id = ?').get(id));
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.FINANCE, action: 'ledger.create',
+    message: `新增收支明細（${entry_type}）`, userId: req.user.id, schoolId: req.params.schoolId, entityType: 'ledger_entry', entityId: id,
+  });
+  res.status(201).json(financeRepository.findLedgerEntryById(req.params.schoolId, id));
 });
 
 // 編輯一筆已存在的收支明細（含自動產生的學費/薪資），用來填入實收/實付金額或修正日期、備註
 financeRouter.put('/ledger/:id', (req, res) => {
-  const existing = db
-    .prepare('SELECT * FROM ledger_entries WHERE id = ? AND school_id = ?')
-    .get(req.params.id, req.params.schoolId);
+  const existing = financeRepository.findLedgerEntryById(req.params.schoolId, req.params.id);
   if (!existing) return res.status(404).json({ error: 'not found' });
 
   const { amount = existing.amount, entry_date = existing.entry_date, note = existing.note } = req.body;
-  db.prepare('UPDATE ledger_entries SET amount = ?, entry_date = ?, note = ? WHERE id = ?').run(
-    amount,
-    entry_date,
-    note,
-    req.params.id
-  );
+  financeRepository.updateLedgerEntryFields(req.params.id, { amount, entryDate: entry_date, note });
 
   broadcastChange(req.params.schoolId, 'finance');
-  res.json(db.prepare('SELECT * FROM ledger_entries WHERE id = ?').get(req.params.id));
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.FINANCE, action: 'ledger.update',
+    message: '更新收支明細', userId: req.user.id, schoolId: req.params.schoolId, entityType: 'ledger_entry', entityId: req.params.id,
+  });
+  res.json(financeRepository.findLedgerEntryById(req.params.schoolId, req.params.id));
 });
 
 financeRouter.delete('/ledger/:id', (req, res) => {
-  const existing = db.prepare('SELECT * FROM ledger_entries WHERE id = ? AND school_id = ?').get(req.params.id, req.params.schoolId);
+  const existing = financeRepository.findLedgerEntryById(req.params.schoolId, req.params.id);
   if (!existing) return res.status(204).end();
 
   const label = `${existing.entry_date} ${existing.entry_type === 'income' ? '收入' : '支出'} ${existing.amount}${existing.note ? ` ${existing.note}` : ''}`;
@@ -96,36 +85,28 @@ financeRouter.delete('/ledger/:id', (req, res) => {
     teacherId: existing.related_teacher_id || null,
   });
 
-  db.prepare('DELETE FROM ledger_entries WHERE id = ? AND school_id = ?').run(req.params.id, req.params.schoolId);
+  financeRepository.deleteLedgerEntry(req.params.schoolId, req.params.id);
   broadcastChange(req.params.schoolId, 'finance');
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.FINANCE, action: 'ledger.delete',
+    message: `刪除收支明細「${label}」`, userId: req.user.id, schoolId: req.params.schoolId, entityType: 'ledger_entry', entityId: req.params.id,
+  });
   res.status(204).end();
 });
 
 // 某筆明細的逐堂課清單（薪資=該教師當月所有課堂；學費=該學生當月所有計價課堂，含學生/科目名稱）
 financeRouter.get('/ledger/:id/detail', (req, res) => {
-  const entry = db
-    .prepare('SELECT * FROM ledger_entries WHERE id = ? AND school_id = ?')
-    .get(req.params.id, req.params.schoolId);
+  const entry = financeRepository.findLedgerEntryById(req.params.schoolId, req.params.id);
   if (!entry) return res.status(404).json({ error: 'not found' });
 
   const month = entry.entry_date.slice(0, 7);
   const [start, end] = monthRange(month);
 
   if (entry.category === 'salary' && entry.related_payslip_id) {
-    const items = db
-      .prepare(
-        `SELECT pi.id as session_id, pi.session_id as class_session_id, pi.hours, pi.rate, pi.pay, cs.session_date, cs.subject, cs.type, cs.start_slot, cs.duration_slots,
-                origin.session_date as origin_session_date, origin.start_slot as origin_start_slot
-         FROM payslip_items pi JOIN class_sessions cs ON cs.id = pi.session_id
-         LEFT JOIN class_sessions origin ON origin.id = cs.origin_session_id
-         WHERE pi.payslip_id = ? ORDER BY cs.session_date`
-      )
-      .all(entry.related_payslip_id);
+    const items = financeRepository.findPayslipItemsWithSessionForLedgerDetail(entry.related_payslip_id);
     const withStudents = items.map((i) => {
-      const students = db
-        .prepare(`SELECT s.name FROM session_students ss JOIN students s ON s.id = ss.student_id WHERE ss.session_id = ?`)
-        .all(i.class_session_id);
-      return { ...i, student_names: students.map((s) => s.name), is_admin: students.length === 0 };
+      const names = financeRepository.findSessionStudentNames(i.class_session_id);
+      return { ...i, student_names: names, is_admin: names.length === 0 };
     });
     return res.json(withStudents);
   }
@@ -133,16 +114,7 @@ financeRouter.get('/ledger/:id/detail', (req, res) => {
     return res.json(calcTeacherSalary(req.params.schoolId, entry.related_teacher_id, start, end).items);
   }
   if (entry.category === 'tuition' && entry.related_invoice_id) {
-    const items = db
-      .prepare(
-        `SELECT ii.id as session_id, cs.session_date, cs.subject, cs.type, cs.start_slot, cs.duration_slots, ii.unit_price,
-                origin.session_date as origin_session_date, origin.start_slot as origin_start_slot
-         FROM invoice_items ii JOIN class_sessions cs ON cs.id = ii.session_id
-         LEFT JOIN class_sessions origin ON origin.id = cs.origin_session_id
-         WHERE ii.invoice_id = ? ORDER BY cs.session_date`
-      )
-      .all(entry.related_invoice_id);
-    return res.json(items);
+    return res.json(financeRepository.findInvoiceItemsWithSession(entry.related_invoice_id));
   }
   if (entry.category === 'tuition' && entry.related_student_id) {
     const items = calcStudentTuition(req.params.schoolId, entry.related_student_id, start, end).items;
@@ -182,37 +154,41 @@ financeRouter.post('/generate-salary', (req, res) => {
   if (!month) return res.status(400).json({ error: 'month required (YYYY-MM)' });
   const [start, end] = monthRange(month);
 
-  const payslips = db
-    .prepare(
-      `SELECT p.*, t.name as teacher_name FROM payslips p
-       JOIN teachers t ON t.id = p.teacher_id
-       WHERE p.school_id = ? AND p.issued_date >= ? AND p.issued_date < ?`
-    )
-    .all(req.params.schoolId, start, end);
+  const payslips = financeRepository.findPayslipsIssuedInRange(req.params.schoolId, start, end);
 
   const created = [];
   const updated = [];
   for (const payslip of payslips) {
     const note = `${month} 薪資 - ${payslip.teacher_name}`;
-    const existing = db
-      .prepare(`SELECT id FROM ledger_entries WHERE school_id = ? AND category = 'salary' AND related_payslip_id = ?`)
-      .get(req.params.schoolId, payslip.id);
+    const existing = financeRepository.findLedgerEntryByPayslip(req.params.schoolId, payslip.id);
 
     if (existing) {
-      db.prepare('UPDATE ledger_entries SET amount = ?, note = ? WHERE id = ?').run(payslip.total_amount, note, existing.id);
+      financeRepository.updateLedgerEntryAmountNote(existing.id, { amount: payslip.total_amount, note });
       updated.push(existing.id);
       continue;
     }
 
     const id = nanoid();
-    db.prepare(
-      `INSERT INTO ledger_entries (id, school_id, entry_type, category, amount, entry_date, related_teacher_id, related_payslip_id, note)
-       VALUES (?, ?, 'expense', 'salary', ?, ?, ?, ?, ?)`
-    ).run(id, req.params.schoolId, payslip.total_amount, payslip.issued_date, payslip.teacher_id, payslip.id, note);
+    financeRepository.createLedgerEntry({
+      id,
+      schoolId: req.params.schoolId,
+      entryType: 'expense',
+      category: 'salary',
+      amount: payslip.total_amount,
+      entryDate: payslip.issued_date,
+      relatedTeacherId: payslip.teacher_id,
+      relatedPayslipId: payslip.id,
+      note,
+    });
     created.push(id);
   }
 
   broadcastChange(req.params.schoolId, 'finance');
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.FINANCE, action: 'ledger.generate_salary',
+    message: `產生 ${month} 教師薪資支出`, userId: req.user.id, schoolId: req.params.schoolId,
+    metadata: { month, created: created.length, updated: updated.length },
+  });
   res.status(201).json({ created: created.length, updated: updated.length });
 });
 
@@ -223,37 +199,41 @@ financeRouter.post('/generate-tuition', (req, res) => {
   if (!month) return res.status(400).json({ error: 'month required (YYYY-MM)' });
   const [start, end] = monthRange(month);
 
-  const invoices = db
-    .prepare(
-      `SELECT inv.*, s.name as student_name FROM invoices inv
-       JOIN students s ON s.id = inv.student_id
-       WHERE inv.school_id = ? AND inv.issued_date >= ? AND inv.issued_date < ?`
-    )
-    .all(req.params.schoolId, start, end);
+  const invoices = financeRepository.findInvoicesIssuedInRange(req.params.schoolId, start, end);
 
   const created = [];
   const updated = [];
   for (const invoice of invoices) {
     if (!invoice.total_amount) continue;
     const note = `${month} 學費 - ${invoice.student_name}`;
-    const existing = db
-      .prepare(`SELECT id FROM ledger_entries WHERE school_id = ? AND category = 'tuition' AND related_invoice_id = ?`)
-      .get(req.params.schoolId, invoice.id);
+    const existing = financeRepository.findLedgerEntryByInvoice(req.params.schoolId, invoice.id);
 
     if (existing) {
-      db.prepare('UPDATE ledger_entries SET amount = ?, note = ? WHERE id = ?').run(invoice.total_amount, note, existing.id);
+      financeRepository.updateLedgerEntryAmountNote(existing.id, { amount: invoice.total_amount, note });
       updated.push(existing.id);
       continue;
     }
 
     const id = nanoid();
-    db.prepare(
-      `INSERT INTO ledger_entries (id, school_id, entry_type, category, amount, entry_date, related_student_id, related_invoice_id, note)
-       VALUES (?, ?, 'income', 'tuition', ?, ?, ?, ?, ?)`
-    ).run(id, req.params.schoolId, invoice.total_amount, invoice.issued_date, invoice.student_id, invoice.id, note);
+    financeRepository.createLedgerEntry({
+      id,
+      schoolId: req.params.schoolId,
+      entryType: 'income',
+      category: 'tuition',
+      amount: invoice.total_amount,
+      entryDate: invoice.issued_date,
+      relatedStudentId: invoice.student_id,
+      relatedInvoiceId: invoice.id,
+      note,
+    });
     created.push(id);
   }
 
   broadcastChange(req.params.schoolId, 'finance');
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.FINANCE, action: 'ledger.generate_tuition',
+    message: `產生 ${month} 學費收入`, userId: req.user.id, schoolId: req.params.schoolId,
+    metadata: { month, created: created.length, updated: updated.length },
+  });
   res.status(201).json({ created: created.length, updated: updated.length });
 });

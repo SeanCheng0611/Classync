@@ -112,9 +112,90 @@ technical debt，Wave 2/3 遇到類似狀況會依樣處理，最後統一評估
   `INSERT ... ON CONFLICT (session_id, person_type, person_id) DO UPDATE SET ...`（`attendance_records`
   已經有這個 UNIQUE constraint），但這是 Phase 1C 的優化選項，不是遷移必須項目。
 
+## Wave 3A — Finance
+
+### Money Representation
+
+已核對 `schema.sql` 實際欄位型別（不是憑印象假設）：
+
+| Table | Column | SQLite Type | 單位 | Nullable | 備註 |
+|---|---|---|---|---|---|
+| `students` | `tuition_monthly` | INTEGER | 元 | NOT NULL DEFAULT 0 | 估算備援值 |
+| `teachers` | `rate_grade_1_6`/`rate_grade_7_9`/`rate_grade_10_12`/`rate_admin` | INTEGER | 元/小時 | NOT NULL DEFAULT 0 | |
+| `schedule_templates`/`class_sessions` | `rate_override` | INTEGER | 元/小時 | 可 NULL（NULL = 沿用教師檔案時薪） | |
+| `session_students`/`template_students` | `unit_price` | INTEGER | 元/堂 | NOT NULL DEFAULT 0 | |
+| `tuition_records` | `unit_price`/`expected_amount`/`actual_amount` | INTEGER | 元 | NOT NULL DEFAULT 0 | |
+| `invoices`/`payslips` | `total_amount` | INTEGER | 元 | NOT NULL DEFAULT 0 | |
+| `invoice_items` | `unit_price` | INTEGER | 元 | NOT NULL DEFAULT 0 | |
+| `payslip_items` | `hours` | **REAL** | 小時 | NOT NULL DEFAULT 0 | 唯一非整數金額相關欄位，因為半小時堂課 `duration_slots/2` 可能是 `1.5` 這種值 |
+| `payslip_items` | `rate`/`pay` | INTEGER | 元/小時、元 | NOT NULL DEFAULT 0 | `pay` 寫入前用 `Math.round()`，見下方 Rounding |
+| `ledger_entries` | `amount` | INTEGER | 元 | NOT NULL（無 DEFAULT，呼叫端必填） | |
+
+**全部金額欄位都是 INTEGER（新台幣元，無小數位）**，只有 `payslip_items.hours` 是 REAL。這代表：
+- 目前系統**沒有分幣（cents）概念**，PostgreSQL 遷移時金額欄位可以直接對應 `INTEGER`/`BIGINT`，
+  不需要引入 `NUMERIC`/cents 轉換這類複雜度，除非未來產品需求真的要支援非整數金額。
+- `hours` 用 REAL 儲存半小時堂課時數（`duration_slots / 2`，`duration_slots` 是整數，所以 `hours`
+  只會是 `0.5` 的倍數，不會有真正的浮點誤差風險，但 PostgreSQL 對應時建議用 `NUMERIC(4,1)` 而不是
+  `DOUBLE PRECISION`，避免不必要的浮點運算語意差異）。
+
+### Rounding
+
+- `services/finance.js` 的 `calcSessionPay`/`calcTeacherSalary` 計算過程中金額是 JS number（可能有
+  小數，例如 0.5 小時 × 奇數時薪），**不會**在計算階段 round。
+- 只有在寫入 `payslip_items`/`payslips` 時才 `Math.round()`（`routes/payslips.js` 的
+  `Math.round(total)`、`Math.round(i.pay)`），也就是「試算階段可能顯示小數，正式開立才四捨五入定案」。
+  Wave 3A **沒有**改動這個行為，只是把 SQL 位置搬動，rounding 時機與方式完全一致。
+- `tuition_records`/`invoices`/`ledger_entries` 相關金額目前**沒有**看到任何 rounding 呼叫——這些金額
+  來自 `unit_price`（本身就是整數輸入）加總，不會產生小數，所以不需要 round，這不是遺漏。
+
+### SUM / NULL Behavior
+
+- `financeRepository.findLedgerSummaryRows` 用 `SUM(amount) GROUP BY entry_type, category`。SQLite
+  的 `SUM()` 對於「該分組完全沒有符合條件的列」不會出現在結果裡（不是回傳 0 的 row），這跟目前
+  route 的處理方式一致（`rows.filter(...).reduce(...)`，沒有列就是加總 0，行為正確）。PostgreSQL 的
+  `SUM()` 語意相同，這裡遷移風險低。
+- `ledger_entries.amount` 是 `NOT NULL`，schema 沒有允許 NULL，遷移到 PostgreSQL 維持 `NOT NULL`
+  沒有語意落差。
+
+### Date / Month Representation
+
+- `invoices.issued_date`/`payslips.issued_date`：`DATE`（`date('now')` 預設，格式 `YYYY-MM-DD`）。
+- `tuition_records.month`：**TEXT**，格式 `'YYYY-MM'`（不是真正的 DATE 型別，只是字串），
+  `services/finance.js` 的 `monthRange()`/`shiftMonth()` 純用字串切割與加減運算這個「月份字串」，
+  沒有依賴 SQLite 的 date 函式做月份運算。PostgreSQL 遷移時這個「月份用字串表示」的慣例可以直接沿用
+  （`TEXT` 對應 `TEXT`/`VARCHAR`），或者改用 PostgreSQL 的 `DATE`（每月固定存第一天）── 這是 Phase 1C
+  的設計決策，Wave 3A 不建議現在改，因為 `UNIQUE (student_id, month)` 這個 constraint 現在是綁在字串
+  相等比對上，改型別要一併確認 constraint 語意不變。
+- `ledger_entries.entry_date`：`TEXT NOT NULL`（沒有 DEFAULT，由呼叫端提供，可能是使用者輸入的日期或
+  `invoices/payslips.issued_date` 帶過來的值）。
+
+### Unique Constraints
+
+- `invoice_items.session_id UNIQUE`、`payslip_items.session_id UNIQUE`：這是「每堂課只能被開立一次」
+  業務規則的資料庫層防線（route 層有先查後寫的邏輯，但 UNIQUE constraint 是最後一道防線，見
+  `docs/FINANCE_TRANSACTION_INVENTORY.md` 的併發風險分析）。PostgreSQL 對應 `UNIQUE` 語法完全相同。
+- `tuition_records UNIQUE (student_id, month)`：同理，PostgreSQL 相容。
+
+### Foreign Keys
+
+- `ledger_entries` 對 `invoices`/`payslips`/`students`/`teachers` 全部是 `ON DELETE SET NULL`
+  （不是 CASCADE）——這是刻意設計：業務邏輯用應用層 `DELETE FROM ledger_entries WHERE
+  related_invoice_id = ?` 先手動清除相關 ledger，而不是依賴 FK CASCADE 自動處理，PostgreSQL 遷移時
+  這個「應用層先清除、FK 只是保險」的模式要維持一致，不要因為 PostgreSQL 支援更靈活的 CASCADE 選項
+  就順手改掉語意。
+- `invoice_items`/`payslip_items` 對 `invoices`/`payslips` 是 `ON DELETE CASCADE`，這個沒問題，
+  PostgreSQL 語法相同。
+
+### Transaction Assumptions（Wave 3B 待處理，先記錄現況）
+
+Invoice/Payslip 的建立與刪除目前**完全沒有** transaction 保護（見
+`docs/FINANCE_TRANSACTION_INVENTORY.md` 的詳細分析）。Phase 1C 遷移到 PostgreSQL 時，如果 Wave 3B
+還沒把這些操作包成 repository 自帶 transaction 的方法，遷移後的 async transaction（見本文件開頭
+「Transaction 語意」段落）**必須**同時解決這個問題，不能延續「沒有 transaction 保護」的現況——
+PostgreSQL 環境下網路延遲更容易放大「invoice 建立成功但 items 寫入中途失敗」的機率。
+
 ## 待補充（後續 Wave）
 
-- Wave 3（finance）：`invoices`/`invoice_items`/`payslips`/`payslip_items`/`ledger_entries` 是否有多步驟
-  transaction 需要在 Phase 1C 特別注意。
 - Wave 4（cross-cutting）：`auth.js`（LINE Login upsert）、`inviteCodes.js`、`notes.js`、`trash.js` 的
   SQLite 特定行為。
+- Wave 3B：Invoice/Payslip transaction 化後，補充實際採用的 transaction 設計對 Phase 1C 的影響。

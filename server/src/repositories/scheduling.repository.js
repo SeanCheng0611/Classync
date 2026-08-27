@@ -168,6 +168,16 @@ export const schedulingRepository = {
     return db.prepare('SELECT id FROM class_sessions WHERE template_id = ? AND session_date = ?').get(templateId, date);
   },
 
+  // 教師在區間內的所有課堂（含行政課堂），給薪資試算/開立薪資條頁用（services/finance.js）
+  findSessionsByTeacherAndDateRange(schoolId, teacherId, startDate, endDateExclusive) {
+    return db
+      .prepare(
+        `SELECT * FROM class_sessions WHERE school_id = ? AND teacher_id = ? AND session_date >= ? AND session_date < ? AND cancelled = 0
+         ORDER BY session_date, start_slot`
+      )
+      .all(schoolId, teacherId, startDate, endDateExclusive);
+  },
+
   // 教師當天候選課堂（同一天，排除自己），實際時段重疊判斷留在 service
   findSessionsByTeacherAndDate(schoolId, teacherId, date, excludeSessionId) {
     return db
@@ -283,6 +293,23 @@ export const schedulingRepository = {
     return db
       .prepare(`SELECT s.id, s.name, ss.unit_price FROM session_students ss JOIN students s ON s.id = ss.student_id WHERE ss.session_id = ?`)
       .all(sessionId);
+  },
+
+  // 該學生在區間內的課堂 + 對應出缺勤狀態（學生詳細頁的課堂/出缺勤紀錄表用，routes/students.js）
+  findStudentSessionsInRange(schoolId, studentId, start, end) {
+    return db
+      .prepare(
+        `SELECT cs.id as session_id, cs.session_date, cs.start_slot, cs.duration_slots, cs.subject, cs.teacher_id, cs.type,
+                ss.unit_price, ar.status as attendance_status, ar.makeup_arranged, ar.makeup_session_id,
+                origin.session_date as origin_session_date, origin.start_slot as origin_start_slot
+         FROM session_students ss
+         JOIN class_sessions cs ON cs.id = ss.session_id
+         LEFT JOIN attendance_records ar ON ar.session_id = cs.id AND ar.person_type = 'student' AND ar.person_id = ss.student_id
+         LEFT JOIN class_sessions origin ON origin.id = cs.origin_session_id
+         WHERE cs.school_id = ? AND ss.student_id = ? AND cs.session_date >= ? AND cs.session_date < ? AND cs.cancelled = 0
+         ORDER BY cs.session_date, cs.start_slot`
+      )
+      .all(schoolId, studentId, start, end);
   },
 };
 

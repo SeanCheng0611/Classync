@@ -15,3 +15,4 @@ export { schedulingRepository } from './scheduling.repository.js';
 export { attendanceRepository } from './attendance.repository.js';
 export { seatsRepository } from './seats.repository.js';
 export { auditLogsRepository } from './auditLogs.repository.js';
+export { financeRepository } from './finance.repository.js';

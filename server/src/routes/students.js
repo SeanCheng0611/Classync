@@ -1,7 +1,6 @@
 import { Router } from 'express';
 import { nanoid } from 'nanoid';
-import { db } from '../db/index.js';
-import { studentsRepository } from '../repositories/index.js';
+import { studentsRepository, schedulingRepository, financeRepository } from '../repositories/index.js';
 import { requireMembership } from '../auth/middleware.js';
 import { broadcastChange } from '../realtime/index.js';
 import { ensureSessionsForRange } from '../services/sessions.js';
@@ -38,7 +37,6 @@ studentsRouter.get('/:id', (req, res) => {
 });
 
 // 該學生在區間內的課堂與對應出缺勤狀態（詳細頁的課堂/出缺勤紀錄用）
-// 課堂/出缺勤查詢屬於 scheduling domain，留待該 Wave 再抽離 repository
 studentsRouter.get('/:id/sessions', (req, res) => {
   const student = studentsRepository.findById(req.params.schoolId, req.params.id);
   if (!student) return res.status(404).json({ error: 'not found' });
@@ -51,25 +49,11 @@ studentsRouter.get('/:id/sessions', (req, res) => {
 
   ensureSessionsForRange(req.params.schoolId, start, end);
 
-  const rows = db
-    .prepare(
-      `SELECT cs.id as session_id, cs.session_date, cs.start_slot, cs.duration_slots, cs.subject, cs.teacher_id, cs.type,
-              ss.unit_price, ar.status as attendance_status, ar.makeup_arranged, ar.makeup_session_id,
-              origin.session_date as origin_session_date, origin.start_slot as origin_start_slot
-       FROM session_students ss
-       JOIN class_sessions cs ON cs.id = ss.session_id
-       LEFT JOIN attendance_records ar ON ar.session_id = cs.id AND ar.person_type = 'student' AND ar.person_id = ss.student_id
-       LEFT JOIN class_sessions origin ON origin.id = cs.origin_session_id
-       WHERE cs.school_id = ? AND ss.student_id = ? AND cs.session_date >= ? AND cs.session_date < ? AND cs.cancelled = 0
-       ORDER BY cs.session_date, cs.start_slot`
-    )
-    .all(req.params.schoolId, req.params.id, start, end);
-
+  const rows = schedulingRepository.findStudentSessionsInRange(req.params.schoolId, req.params.id, start, end);
   res.json(rows.map((r) => ({ ...r, makeup_arranged: !!r.makeup_arranged })));
 });
 
 // 該學生某月的應收/實收金額紀錄（財務資料，僅管理者）
-// tuition_records 查詢屬於 finance domain，留待該 Wave 再抽離 repository
 studentsRouter.get('/:id/tuition', requireMembership(['admin']), (req, res) => {
   const { month } = req.query;
   if (!month) return res.status(400).json({ error: 'month required (YYYY-MM)' });
@@ -78,9 +62,7 @@ studentsRouter.get('/:id/tuition', requireMembership(['admin']), (req, res) => {
   if (!student) return res.status(404).json({ error: 'not found' });
 
   const calc = calcStudentTuitionForMonth(req.params.schoolId, req.params.id, month);
-  const record = db
-    .prepare('SELECT * FROM tuition_records WHERE student_id = ? AND month = ?')
-    .get(req.params.id, month);
+  const record = financeRepository.findTuitionRecord(req.params.id, month);
 
   // 若本月已存檔，但上個月的紀錄在存檔「之後」又被修改（例如事後才補標記未收/併入次月），
   // 存檔當下寫死的結轉金額就會過期，這裡比對現在重新試算的結轉金額，不同就提醒管理者重新確認
@@ -119,35 +101,38 @@ studentsRouter.put('/:id/tuition', requireMembership(['admin']), (req, res) => {
   const unitPrice = Number(unit_price) || 0;
   const expectedAmount = sessionCount * unitPrice + calc.rollover_amount;
 
-  const existing = db
-    .prepare('SELECT * FROM tuition_records WHERE student_id = ? AND month = ?')
-    .get(req.params.id, month);
+  const existing = financeRepository.findTuitionRecord(req.params.id, month);
 
   if (existing) {
-    db.prepare(
-      `UPDATE tuition_records SET session_count=?, unit_price=?, expected_amount=?, actual_amount=?, rollover=?, note=?, updated_at=datetime('now')
-       WHERE id = ?`
-    ).run(sessionCount, unitPrice, expectedAmount, Number(actual_amount) || 0, rollover ? 1 : 0, note || null, existing.id);
+    financeRepository.updateTuitionRecord(existing.id, {
+      sessionCount,
+      unitPrice,
+      expectedAmount,
+      actualAmount: Number(actual_amount) || 0,
+      rollover,
+      note: note || null,
+    });
   } else {
-    db.prepare(
-      `INSERT INTO tuition_records (id, school_id, student_id, month, session_count, unit_price, expected_amount, actual_amount, rollover, note)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      nanoid(),
-      req.params.schoolId,
-      req.params.id,
+    financeRepository.createTuitionRecord({
+      id: nanoid(),
+      schoolId: req.params.schoolId,
+      studentId: req.params.id,
       month,
       sessionCount,
       unitPrice,
       expectedAmount,
-      Number(actual_amount) || 0,
-      rollover ? 1 : 0,
-      note || null
-    );
+      actualAmount: Number(actual_amount) || 0,
+      rollover,
+      note: note || null,
+    });
   }
 
   broadcastChange(req.params.schoolId, 'finance');
-  const record = db.prepare('SELECT * FROM tuition_records WHERE student_id = ? AND month = ?').get(req.params.id, month);
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.STUDENTS, action: 'tuition_record.upsert',
+    message: `更新學費紀錄（${month}）`, userId: req.user.id, schoolId: req.params.schoolId, entityType: 'tuition_record', entityId: req.params.id,
+  });
+  const record = financeRepository.findTuitionRecord(req.params.id, month);
   res.json({ ...record, rollover: !!record.rollover });
 });
 
@@ -155,9 +140,7 @@ studentsRouter.delete('/:id/tuition', requireMembership(['admin']), (req, res) =
   const { month } = req.query;
   if (!month) return res.status(400).json({ error: 'month required (YYYY-MM)' });
 
-  const existing = db
-    .prepare('SELECT * FROM tuition_records WHERE school_id = ? AND student_id = ? AND month = ?')
-    .get(req.params.schoolId, req.params.id, month);
+  const existing = financeRepository.findTuitionRecordScoped(req.params.schoolId, req.params.id, month);
   if (existing) {
     const student = studentsRepository.findById(req.params.schoolId, req.params.id);
     addToTrash(
@@ -170,13 +153,13 @@ studentsRouter.delete('/:id/tuition', requireMembership(['admin']), (req, res) =
     );
   }
 
-  db.prepare('DELETE FROM tuition_records WHERE school_id = ? AND student_id = ? AND month = ?').run(
-    req.params.schoolId,
-    req.params.id,
-    month
-  );
+  financeRepository.deleteTuitionRecord(req.params.schoolId, req.params.id, month);
 
   broadcastChange(req.params.schoolId, 'finance');
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.STUDENTS, action: 'tuition_record.delete',
+    message: `刪除學費紀錄（${month}）`, userId: req.user.id, schoolId: req.params.schoolId, entityType: 'tuition_record', entityId: req.params.id,
+  });
   res.status(204).end();
 });
 

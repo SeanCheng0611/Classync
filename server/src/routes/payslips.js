@@ -1,11 +1,14 @@
 import { Router } from 'express';
 import { nanoid } from 'nanoid';
 import { db } from '../db/index.js';
+import { financeRepository, teachersRepository, schedulingRepository } from '../repositories/index.js';
 import { requireMembership } from '../auth/middleware.js';
 import { broadcastChange } from '../realtime/index.js';
 import { ensureSessionsForRange } from '../services/sessions.js';
 import { monthRange, calcSessionPay } from '../services/finance.js';
 import { addToTrash, capturePayslip } from '../services/trash.js';
+import { logEvent } from '../services/auditLog.service.js';
+import { PAGE_KEYS } from '../constants/pageKeys.js';
 
 export const payslipsRouter = Router({ mergeParams: true });
 payslipsRouter.use(requireMembership(['admin']));
@@ -15,22 +18,17 @@ payslipsRouter.get('/sessions', (req, res) => {
   const { teacher_id, month } = req.query;
   if (!teacher_id || !month) return res.status(400).json({ error: 'teacher_id and month required' });
 
-  const teacher = db.prepare('SELECT * FROM teachers WHERE id = ? AND school_id = ?').get(teacher_id, req.params.schoolId);
+  const teacher = teachersRepository.findById(req.params.schoolId, teacher_id);
   if (!teacher) return res.status(404).json({ error: 'teacher not found' });
 
   const [start, end] = monthRange(month);
   ensureSessionsForRange(req.params.schoolId, start, end);
 
-  const sessions = db
-    .prepare(
-      `SELECT * FROM class_sessions WHERE school_id = ? AND teacher_id = ? AND session_date >= ? AND session_date < ? AND cancelled = 0
-       ORDER BY session_date, start_slot`
-    )
-    .all(req.params.schoolId, teacher_id, start, end);
+  const sessions = schedulingRepository.findSessionsByTeacherAndDateRange(req.params.schoolId, teacher_id, start, end);
 
   const rows = sessions.map((session) => {
     const pay = calcSessionPay(teacher, session);
-    const issued = !!db.prepare('SELECT 1 FROM payslip_items WHERE session_id = ?').get(session.id);
+    const issued = financeRepository.hasPayslipItemForSession(session.id);
     return { ...pay, issued };
   });
 
@@ -42,17 +40,13 @@ payslipsRouter.get('/', (req, res) => {
   const { teacher_id } = req.query;
   if (!teacher_id) return res.status(400).json({ error: 'teacher_id required' });
 
-  const rows = db
-    .prepare(
-      `SELECT p.*, (SELECT COUNT(*) FROM payslip_items WHERE payslip_id = p.id) as item_count
-       FROM payslips p WHERE p.school_id = ? AND p.teacher_id = ?
-       ORDER BY p.issued_date DESC, p.created_at DESC`
-    )
-    .all(req.params.schoolId, teacher_id);
-  res.json(rows);
+  res.json(financeRepository.findPayslipsByTeacher(req.params.schoolId, teacher_id));
 });
 
 // 開立薪資條：從指定的課堂（須屬於該教師、尚未開立過）挑選建立，可跨月
+//
+// NOTE（Wave 3A）：橫跨 payslips + payslip_items 兩張表寫入，屬於 Wave 3B 範圍，
+// 詳見 docs/FINANCE_TRANSACTION_INVENTORY.md 的「Create Payslip」項目，刻意沒有搬進 financeRepository。
 payslipsRouter.post('/', (req, res) => {
   const { teacher_id, session_ids, note } = req.body;
   if (!teacher_id || !Array.isArray(session_ids) || session_ids.length === 0) {
@@ -100,34 +94,31 @@ payslipsRouter.post('/', (req, res) => {
   for (const i of items) insertItem.run(nanoid(), payslipId, i.session_id, i.hours, i.rate, Math.round(i.pay));
 
   broadcastChange(req.params.schoolId, 'finance');
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.PAYSLIPS, action: 'payslip.create',
+    message: `開立薪資條（${teacher.name}）`, userId: req.user.id, schoolId: req.params.schoolId,
+    entityType: 'payslip', entityId: payslipId, metadata: { item_count: items.length },
+  });
   res.status(201).json(db.prepare('SELECT * FROM payslips WHERE id = ?').get(payslipId));
 });
 
 // 單張薪資條明細（逐堂課清單）
 payslipsRouter.get('/:id', (req, res) => {
-  const payslip = db.prepare('SELECT * FROM payslips WHERE id = ? AND school_id = ?').get(req.params.id, req.params.schoolId);
+  const payslip = financeRepository.findPayslipById(req.params.schoolId, req.params.id);
   if (!payslip) return res.status(404).json({ error: 'not found' });
 
-  const items = db
-    .prepare(
-      `SELECT pi.id, pi.session_id, pi.hours, pi.rate, pi.pay, cs.session_date, cs.subject, cs.type, cs.start_slot, cs.duration_slots,
-              origin.session_date as origin_session_date, origin.start_slot as origin_start_slot
-       FROM payslip_items pi JOIN class_sessions cs ON cs.id = pi.session_id
-       LEFT JOIN class_sessions origin ON origin.id = cs.origin_session_id
-       WHERE pi.payslip_id = ? ORDER BY cs.session_date`
-    )
-    .all(req.params.id);
+  const items = financeRepository.findPayslipItemsWithSession(req.params.id);
   const withStudents = items.map((i) => {
-    const students = db
-      .prepare(`SELECT s.name FROM session_students ss JOIN students s ON s.id = ss.student_id WHERE ss.session_id = ?`)
-      .all(i.session_id);
-    return { ...i, student_names: students.map((s) => s.name), is_admin: students.length === 0 };
+    const names = financeRepository.findSessionStudentNames(i.session_id);
+    return { ...i, student_names: names, is_admin: names.length === 0 };
   });
 
   res.json({ ...payslip, items: withStudents });
 });
 
 // 刪除薪資條：釋放其中的課堂讓它們可以被重新開立，若已產生對應的收支明細也一併刪除
+//
+// NOTE（Wave 3A）：橫跨 payslips + ledger_entries 寫入，屬於 Wave 3B 範圍，刻意沒有搬進 financeRepository。
 payslipsRouter.delete('/:id', (req, res) => {
   const payslip = db.prepare('SELECT * FROM payslips WHERE id = ? AND school_id = ?').get(req.params.id, req.params.schoolId);
   if (!payslip) return res.status(404).json({ error: 'not found' });
@@ -140,5 +131,10 @@ payslipsRouter.delete('/:id', (req, res) => {
   db.prepare('DELETE FROM payslips WHERE id = ?').run(req.params.id);
 
   broadcastChange(req.params.schoolId, 'finance');
+  logEvent({
+    category: 'DATA_CHANGE', pageKey: PAGE_KEYS.PAYSLIPS, action: 'payslip.delete',
+    message: `刪除薪資條「${label}」`, userId: req.user.id, schoolId: req.params.schoolId,
+    entityType: 'payslip', entityId: req.params.id,
+  });
   res.status(204).end();
 });

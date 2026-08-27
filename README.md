@@ -164,6 +164,15 @@ docker compose ps              # 看狀態
 docker compose down            # 停止（不會刪資料，volume 保留）
 ```
 
+⚠️ **剛裝好 Docker Desktop 後，`docker` 指令在原本就開著的終端機視窗裡會找不到**（`CommandNotFoundException`）：
+安裝程式會把 Docker 加進系統 PATH，但已經開啟的視窗不會自動重新讀取 PATH。兩個辦法：
+
+1. 直接關掉該視窗，重新開一個新的 PowerShell，PATH 就是最新的。
+2. 不想關視窗的話，先貼上這行手動刷新 PATH，再執行 `docker` 指令：
+   ```powershell
+   $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
+   ```
+
 Backend container 用 bind mount 把整個專案目錄掛進去，所以既有的自動部署 webhook
 （`git pull` + 重新 build client，見 `docs/DEPLOY_AUTO_PULL.md`）在 container 裡跑法完全一樣，
 不需要另外改部署流程。`server/.env` 要先準備好（複製 `server/.env.example`），docker-compose 會自動讀取。

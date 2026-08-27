@@ -29,43 +29,41 @@ Phase 0 建立時是純盤點；Phase 1B 開始逐步把直接 SQL 存取收斂�
 | `attendance.repository.js` | `attendance_records` | 2 |
 | `seats.repository.js` | `seat_assignments`, `seat_students` | 2 |
 | `auditLogs.repository.js` | `audit_logs`（cross-cutting infra，不屬於任何 business domain） | 2.1 |
+| `finance.repository.js` | `ledger_entries`, `invoices`/`invoice_items`（唯讀）, `payslips`/`payslip_items`（唯讀）, `tuition_records` | 3A |
 
 ## 統計方式說明（Wave 2.1 起）
 
 Phase 1B 的 KPI 是 **application-layer（routes/services/auth）的直接 SQL 存取數**，不是 repository
-本身的 SQL 數量（repository 裡的 SQL 是預期、合法存在的，不算「散落」）。因此以下分開回報：
+本身的 SQL 數量（repository 裡的 SQL 是預期、合法存在的，不算「散落」）。
 
 ```text
-Application-layer direct SQL（routes + services + auth，扣掉 repositories/db）: 94
-Repository-layer SQL（8 個既有 repository + auditLogs.repository.js 合計，都是預期合法存在）: 79
+Application-layer direct SQL（routes + services + auth，扣掉 repositories/db）: 71
+Repository-layer SQL（10 個 repository 合計，都是預期合法存在）: 108
+db/index.js（schema/migration infra）: 26
 ```
 
-`auditLogs.repository.js` 的 2 處 SQL 是這個 Wave 新增的 cross-cutting infra，**不算 architecture
-regression**——它本來就該在 repository 裡，符合 Completion Gate。
-
-## 直接存取 db 的檔案（Wave 2.1 之後現況，application layer）
+## 直接存取 db 的檔案（Wave 3A 之後現況，application layer）
 
 | 檔案 | 次數 | Domain / 備註 |
 |---|---:|---|
-| server/src/db/index.js | 26 | schema 建置 + migration，infra 層，不算「散落」 |
 | server/src/services/trash.js | 18 | Wave 4（cross-cutting） |
 | server/src/routes/notes.js | 17 | Wave 4（cross-cutting） |
-| server/src/routes/payslips.js | 13 | Wave 3（finance） |
-| server/src/routes/finance.js | 11 | Wave 3（finance） |
-| server/src/routes/invoices.js | 11 | Wave 3（finance） |
+| server/src/routes/payslips.js | 10 | **Wave 3B（刻意保留）**：POST（create payslip+items）與 DELETE（payslip+ledger）是跨表寫入，見 `docs/FINANCE_TRANSACTION_INVENTORY.md`；GET 系列已在 Wave 3A 全部收斂進 repository |
+| server/src/routes/invoices.js | 9 | **Wave 3B（刻意保留）**：POST（create invoice+items）與 DELETE（invoice+ledger）同上；GET 系列已收斂 |
 | server/src/routes/inviteCodes.js | 7 | Wave 4（cross-cutting，含 memberships insert，需與 memberships.repository 協調） |
-| server/src/services/finance.js | 5 | Wave 3（finance） |
-| server/src/routes/students.js | 4 | 僅 `tuition`/`sessions` 子路由，Wave 3（finance：`tuition_records`） |
 | server/src/routes/auth.js | 4 | Wave 4（cross-cutting，LINE Login upsert） |
 | server/src/routes/trash.js | 3 | Wave 4（cross-cutting） |
 | server/src/routes/dev.js | 1 | 開發用假登入輔助路由，Wave 4 可能整條淘汰 |
 
-共 12 個非 infra/repository 檔案、94 處直接 SQL 呼叫。
+共 7 個非 infra/repository 檔案、71 處直接 SQL 呼叫。
 
-`server/src/routes/attendance.js` 與 `server/src/services/attendance.service.js` 都**沒有**任何
-`db.prepare`/`db.exec`。`attendance.service.js` 用 `runInTransaction`（從 `repositories/index.js` 轉出）
-組合 `attendanceRepository` 與 `schedulingRepository` 的呼叫（撤銷點名要同時改 `attendance_records` 與
-`class_sessions`），這是允許的例外（transaction orchestration，不是直接 SQL），符合 Completion Gate。
+`server/src/services/finance.js`、`server/src/routes/students.js`、`server/src/routes/finance.js`
+**都已經沒有任何**直接 SQL——Wave 3A 完成前 `finance.js`（route）11 處、`students.js` 4 處直接 SQL
+全部移進 `financeRepository`/`schedulingRepository`。
+
+`server/src/services/attendance.service.js` 使用 `runInTransaction`（從 `repositories/index.js` 轉出）
+組合 `attendanceRepository` 與 `schedulingRepository`，**沒有**任何 `db.prepare`/`db.exec`，屬於允許的
+transaction orchestration 例外（Wave 2.1 已修正，非本 Wave 新增）。
 
 ## Wave 進度
 
@@ -74,14 +72,20 @@ regression**——它本來就該在 repository 裡，符合 Completion Gate。
 | 起點 | — | — | 218 |
 | Wave 1 | students / teachers / schools / memberships | 76 | 142 |
 | Wave 2 | scheduleTemplates / sessions / seats / attendance | 46 | 96 |
-| Wave 2.1 | Admin Mode + Audit Log infra（新功能，非既有 SQL 搬遷）+ attendance transaction ownership 修正 | 2（attendance.js 的 runInTransaction 呼叫搬進 service） | 94 |
-| Wave 3（待進行） | finance / invoices / payslips | — | — |
+| Wave 2.1 | Admin Mode + Audit Log infra + attendance transaction ownership 修正 | 2 | 94 |
+| Wave 3A | Finance read models + 低風險 CRUD（ledger、tuition_records）+ students.js/finance.js 殘留清理 | 23 | 71 |
+| Wave 3B（待進行） | Invoice/Payslip 跨表 atomic transaction | — | — |
 | Wave 4（待進行） | auth / inviteCodes / notes / trash / dev | — | — |
+
+Wave 3A 移動明細：`services/finance.js`（全部計算邏輯改呼叫 repository）、`routes/finance.js`
+（ledger CRUD + summary + generate-salary/tuition，11 處全移）、`routes/students.js`
+（tuition_records CRUD + 殘留的 class_sessions 查詢，4 處全移）、`routes/invoices.js` 與
+`routes/payslips.js` 的 GET 系列（各自 2 處與 3 處，POST/DELETE 刻意保留給 Wave 3B）。
 
 ## 目標（Wave 4 完成後）
 
 ```text
-routes: 0
+routes: 0（Wave 3B 完成前，invoices.js/payslips.js 仍會各剩個位數 SQL，屬已知且有文件記錄的例外）
 services: 0
 auth: 0
 repositories/db: expected SQL only
